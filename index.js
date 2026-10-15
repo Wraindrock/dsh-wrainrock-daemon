@@ -1,9 +1,9 @@
 /**
- * @local/dsh-ian-daemon — Host half.
+ * @local/dsh-wrainrock-daemon — Host half.
  *
  * Gives DeepSeek Harness three things it does not ship with:
  *
- *  1. **Boot autostart.** A systemd *user* service (`dsh-ian-daemon.service`) runs a
+ *  1. **Boot autostart.** A systemd *user* service (`dsh-wrainrock-daemon.service`) runs a
  *     generated supervisor script at login/boot. Enabling it needs no root; for
  *     it to start without an interactive login the user must linger, which this
  *     plugin also arranges (`loginctl enable-linger`).
@@ -13,14 +13,14 @@
  *     failures in a rolling window. After `failureThreshold` of them it boots the
  *     pristine safe profile, writes an incident report and notifies the desktop.
  *     systemd adds a second layer: if the supervisor itself keeps dying, the
- *     unit's `OnFailure=` starts `dsh-ian-daemon-safemode.service`.
+ *     unit's `OnFailure=` starts `dsh-wrainrock-daemon-safemode.service`.
  *  3. **A manual restart button.** The Client half renders "重启" in the composer
  *     dock and calls this half over HTTP.
  *
  * Everything is plain JavaScript over node builtins: the bundle declares no
  * dependency, so it activates in any profile that installs it.
  *
- * Host entry points (`POST`/`GET /dsh-ian-daemon/...`):
+ * Host entry points (`POST`/`GET /dsh-wrainrock-daemon/...`):
  *   GET  status      full state snapshot (systemd, supervisor, incident, paths)
  *   POST restart     restart now (systemd when managed, detached relaunch else)
  *   POST install     (re)write the supervisor/units, daemon-reload, enable
@@ -38,8 +38,8 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
-const PKG_NAME = '@local/dsh-ian-daemon'
-const ROUTE_PREFIX = '/dsh-ian-daemon'
+const PKG_NAME = '@local/dsh-wrainrock-daemon'
+const ROUTE_PREFIX = '/dsh-wrainrock-daemon'
 
 const SYSTEMD_DEST = 'org.freedesktop.systemd1'
 const MANAGER_PATH = '/org/freedesktop/systemd1'
@@ -50,11 +50,16 @@ const UNIT_IFACE = 'org.freedesktop.systemd1.Unit'
 const BUS_UNREACHABLE = /Failed to connect|Cannot autolaunch|Failed to talk to init daemon|Connection refused|No such file or directory|没有可用的数据|无法连接|拒绝连接/i
 
 /**
- * Every generated file carries one of these markers. The legacy one is kept so
- * the rename from the project's former name (dsh-autostart) never mistakes its
- * own older files for a foreign unit it must not touch.
+ * Every generated file carries one of these markers. The names this project used
+ * before are kept so a rename never mistakes its own earlier files for a foreign
+ * unit it must not touch — and so those earlier units can be retired on install
+ * (see migrateLegacy).
  */
-const GENERATED_MARKERS = ['@local/dsh-ian-daemon', '@local/dsh-autostart']
+const GENERATED_MARKERS = [
+  '@local/dsh-wrainrock-daemon',
+  '@local/dsh-ian-daemon',
+  '@local/dsh-autostart',
+]
 
 /** Filesystem copies that make a profile composable; they are what "corruption" means here. */
 const CONFIG_FILES = ['cordis.yml', 'cordis.patch.yml', 'package.json', 'pnpm-workspace.yaml']
@@ -236,7 +241,7 @@ function busBoolean(text) {
   return match === null ? undefined : match[1] === 'true' || match[1] === 'yes'
 }
 
-/** Unit object path on the manager (`dsh-ian-daemon.service` → `/org/.../unit/dsh_2dharness_2eservice`). */
+/** Unit object path on the manager (`dsh-wrainrock-daemon.service` → `/org/.../unit/dsh_2dharness_2eservice`). */
 async function unitObjectPath(unit) {
   const reply = await managerCall('GetUnit', 's', [unit])
   if (reply.code !== 0) return undefined
@@ -251,13 +256,13 @@ export function createManager(ctx, rawConfig) {
   const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {}
   const home = homedir()
   const dshHome = expandHome(asString(config.dshHome, process.env.DSH_HOME || join(home, '.dsh')), home)
-  const homeDir = expandHome(asString(config.homeDir, ''), home) || join(dshHome, 'ian-daemon')
+  const homeDir = expandHome(asString(config.homeDir, ''), home) || join(dshHome, 'wrainrock-daemon')
   const userName = (() => { try { return userInfo().username } catch { return process.env.USER || '' } })()
 
   const settings = {
-    unitName: asString(config.unitName, 'dsh-ian-daemon.service'),
-    safeUnitName: asString(config.safeUnitName, 'dsh-ian-daemon-safemode.service'),
-    selfTestUnit: asString(config.selfTestUnit, 'dsh-ian-daemon-selftest.service'),
+    unitName: asString(config.unitName, 'dsh-wrainrock-daemon.service'),
+    safeUnitName: asString(config.safeUnitName, 'dsh-wrainrock-daemon-safemode.service'),
+    selfTestUnit: asString(config.selfTestUnit, 'dsh-wrainrock-daemon-selftest.service'),
     profile: asString(config.profile, process.env.DSH_PROFILE || 'web'),
     safeProfile: asString(config.safeProfile, 'dsh-safe'),
     safeTemplate: asString(config.safeTemplate, process.env.DSH_PROFILE || 'web'),
@@ -280,12 +285,26 @@ export function createManager(ctx, rawConfig) {
     notify: asBoolean(config.notify, true),
     nodeBin: asString(config.nodeBin, process.execPath),
     cliPath: expandHome(asString(config.cliPath, ''), home),
-    // Names this project used before it was called dsh-ian-daemon. They are
-    // migrated away automatically on install (see migrateLegacy).
+    // Names this project used before it was called dsh-wrainrock-daemon. An
+    // install made under any of them migrates itself on the first install()
+    // (see migrateLegacy), so upgrading machines need no manual step.
     legacyUnitNames: Array.isArray(config.legacyUnitNames)
       ? config.legacyUnitNames.map(String)
-      : ['dsh-harness.service', 'dsh-harness-safemode.service', 'dsh-autostart-selftest.service'],
-    legacyHomeDir: expandHome(asString(config.legacyHomeDir, ''), home) || join(dshHome, 'autostart'),
+      : [
+          'dsh-ian-daemon.service',
+          'dsh-ian-daemon-safemode.service',
+          'dsh-ian-daemon-selftest.service',
+          'dsh-harness.service',
+          'dsh-harness-safemode.service',
+          'dsh-autostart-selftest.service',
+        ],
+    // Newest former name first, and `config.legacyHomeDir` (singular) still wins
+    // as an explicit override. Only the first directory that exists is carried
+    // over, and only while the current home directory does not exist yet.
+    legacyHomeDirs: (Array.isArray(config.legacyHomeDirs)
+      ? config.legacyHomeDirs.map(String)
+      : [asString(config.legacyHomeDir, ''), join(dshHome, 'ian-daemon'), join(dshHome, 'autostart')]
+    ).map((value) => expandHome(value, home)).filter((value) => value !== '' && value !== homeDir),
   }
 
   const paths = {
@@ -573,8 +592,8 @@ export function createManager(ctx, rawConfig) {
   function writeUnits() {
     const values = templateValues()
     const changed = []
-    const main = render(template('units/dsh-ian-daemon.service.in'), values)
-    const safe = render(template('units/dsh-ian-daemon-safemode.service.in'), values)
+    const main = render(template('units/dsh-wrainrock-daemon.service.in'), values)
+    const safe = render(template('units/dsh-wrainrock-daemon-safemode.service.in'), values)
     if (writeIfChanged(unitPath(settings.unitName), main, 0o644)) changed.push(settings.unitName)
     if (writeIfChanged(unitPath(settings.safeUnitName), safe, 0o644)) changed.push(settings.safeUnitName)
     return changed
@@ -590,7 +609,7 @@ export function createManager(ctx, rawConfig) {
     const existing = readText(unitPath(settings.unitName))
     if (existing === undefined) return []
     if (GENERATED_MARKERS.some((marker) => existing.includes(marker))) return []
-    const suffix = '.pre-dsh-ian-daemon'
+    const suffix = '.pre-dsh-wrainrock-daemon'
     if (existsSync(`${unitPath(settings.unitName)}${suffix}`)) return []
     try {
       copyFileSync(unitPath(settings.unitName), `${unitPath(settings.unitName)}${suffix}`)
@@ -608,8 +627,11 @@ export function createManager(ctx, rawConfig) {
    */
   function migrateLegacy() {
     const done = []
-    const legacy = settings.legacyHomeDir
-    if (legacy !== homeDir && existsSync(legacy) && !existsSync(homeDir)) {
+    // Newest former name first, and only the first one that exists. A current
+    // home directory is never overwritten, so this is a no-op after the first
+    // successful migration and on a fresh install.
+    for (const legacy of settings.legacyHomeDirs) {
+      if (existsSync(homeDir) || !existsSync(legacy)) continue
       try {
         try {
           renameSync(legacy, homeDir)
@@ -623,6 +645,7 @@ export function createManager(ctx, rawConfig) {
       } catch (error) {
         warn(`could not move ${legacy} to ${homeDir}: ${error?.message ?? error}`)
       }
+      break
     }
     for (const unit of settings.legacyUnitNames) {
       if (unit === settings.unitName || unit === settings.safeUnitName) continue
@@ -893,9 +916,9 @@ export function createManager(ctx, rawConfig) {
       const match = new RegExp(`${key}="\\$\\{${env}:-([^}]*)\\}"`).exec(script)
       return match === null ? undefined : match[1]
     }
-    const node = read('NODE_BIN', 'DSH_IAN_DAEMON_NODE')
-    const cli = read('DSH_CLI', 'DSH_IAN_DAEMON_CLI')
-    const appArgs = read('APP_ARGS', 'DSH_IAN_DAEMON_APP_ARGS')
+    const node = read('NODE_BIN', 'DSH_WRAINROCK_DAEMON_NODE')
+    const cli = read('DSH_CLI', 'DSH_WRAINROCK_DAEMON_CLI')
+    const appArgs = read('APP_ARGS', 'DSH_WRAINROCK_DAEMON_APP_ARGS')
     const nodeExists = typeof node === 'string' && node !== '' && existsSync(node)
     const cliExists = typeof cli === 'string' && cli !== '' && existsSync(cli)
     return {
@@ -969,7 +992,7 @@ export function createManager(ctx, rawConfig) {
   // --- restart -------------------------------------------------------------
 
   function isManagedByUnit() {
-    // cgroup v2 writes `0::/user.slice/…/dsh-ian-daemon.service` while the unit runs us.
+    // cgroup v2 writes `0::/user.slice/…/dsh-wrainrock-daemon.service` while the unit runs us.
     return selfCgroup().includes(settings.unitName)
   }
 
@@ -1046,7 +1069,7 @@ export function createManager(ctx, rawConfig) {
     if (back === 'none') return { ok: false, steps, message: 'neither systemctl --user nor the systemd D-Bus manager can be reached' }
 
     try {
-      writeIfChanged(unitPath(unit), template('units/dsh-ian-daemon-selftest.service.in'), 0o644)
+      writeIfChanged(unitPath(unit), template('units/dsh-wrainrock-daemon-selftest.service.in'), 0o644)
       record('write-unit', { ok: true, path: unitPath(unit) })
     } catch (error) {
       return { ok: false, steps, message: `cannot write the selftest unit: ${error?.message ?? error}` }
@@ -1181,8 +1204,8 @@ export function createManager(ctx, rawConfig) {
       return false
     }
     // A custom header keeps a stray cross-site form/img from restarting the app.
-    if (String(req.headers['x-dsh-ian-daemon'] ?? '') !== '1') {
-      sendJson(res, 403, { ok: false, error: 'missing-x-dsh-ian-daemon-header' })
+    if (String(req.headers['x-dsh-wrainrock-daemon'] ?? '') !== '1') {
+      sendJson(res, 403, { ok: false, error: 'missing-x-dsh-wrainrock-daemon-header' })
       return false
     }
     return true
@@ -1372,11 +1395,11 @@ export function apply(ctx, config) {
         try { webCtx.logger?.warn?.(`${PKG_NAME}: activation failed: ${error?.message ?? error}`) } catch { /* ignore */ }
       })
       return () => manager.dispose()
-    }, 'dsh-ian-daemon: activation')
+    }, 'dsh-wrainrock-daemon: activation')
 
     webCtx.effect(() => {
       const disposers = manager.routes().map((route) => webCtx.webServer.register(route))
       return () => { for (const dispose of disposers.reverse()) dispose() }
-    }, 'dsh-ian-daemon: http routes')
+    }, 'dsh-wrainrock-daemon: http routes')
   })
 }

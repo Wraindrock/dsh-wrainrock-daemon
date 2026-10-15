@@ -1,5 +1,5 @@
 /**
- * @local/dsh-ian-daemon — Client half.
+ * @local/dsh-wrainrock-daemon — Client half.
  *
  * Renders the manual "重启" control in two independent places, so one hidden
  * slot can never hide the feature:
@@ -26,13 +26,13 @@
  *     from the server side.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-ian-daemon',
+  id: '@local/dsh-wrainrock-daemon',
   factory(require) {
     const React = require('react')
     const h = React.createElement
 
-    const NS = 'dsh-ian-daemon'
-    const BASE = '/dsh-ian-daemon'
+    const NS = 'dsh-wrainrock-daemon'
+    const BASE = '/dsh-wrainrock-daemon'
     const zh = {
       restart: '重启',
       confirm: '确认重启？',
@@ -91,7 +91,7 @@ window.__ModuleLoader__.load({
     function postJson(path, body) {
       return fetch(`${BASE}${path}`, {
         method: 'POST',
-        headers: { 'x-dsh-ian-daemon': '1', 'content-type': 'text/plain' },
+        headers: { 'x-dsh-wrainrock-daemon': '1', 'content-type': 'text/plain' },
         body,
         cache: 'no-store',
         // The page navigates immediately after the final report; keepalive lets
@@ -385,7 +385,7 @@ window.__ModuleLoader__.load({
       }
 
       componentDidCatch(error) {
-        console.error('dsh-ian-daemon: restart control crashed, using the plain fallback', error)
+        console.error('dsh-wrainrock-daemon: restart control crashed, using the plain fallback', error)
         report('ui:crashed', { message: String(error?.message ?? error) })
       }
 
@@ -401,7 +401,7 @@ window.__ModuleLoader__.load({
         translate = (key) => dicts.zh[key] ?? key
         const locale = typeof ctx.get === 'function' ? ctx.get('locale') : undefined
         if (locale && typeof locale.register === 'function' && typeof locale.bind === 'function') {
-          ctx.effect(() => locale.register(NS, dicts), 'dsh-ian-daemon: dictionaries')
+          ctx.effect(() => locale.register(NS, dicts), 'dsh-wrainrock-daemon: dictionaries')
           try {
             const bound = locale.bind(NS)
             if (typeof bound === 'function') {
@@ -429,14 +429,14 @@ window.__ModuleLoader__.load({
             order,
             label: () => translate('restart'),
           }, make)),
-          `dsh-ian-daemon: ${id}`,
+          `dsh-wrainrock-daemon: ${id}`,
         )
 
-        register('conversation.composer.dock', 'dsh-ian-daemon', 3,
+        register('conversation.composer.dock', 'dsh-wrainrock-daemon', 3,
           () => h(SafeBoundary, { fallback: h(PlainControl, { label: translate('restart'), title: translate('hint') }) },
             h(DockControl, { t: translate })))
 
-        register('sidebar.footer.action', 'dsh-ian-daemon-sidebar', -10,
+        register('sidebar.footer.action', 'dsh-wrainrock-daemon-sidebar', -10,
           (props) => h(SafeBoundary, { fallback: h(PlainControl, { label: translate('restart'), title: translate('hint') }) },
             h(SidebarControl, { t: translate, wide: props?.wide })))
       },

@@ -1,13 +1,13 @@
-# @local/dsh-ian-daemon — one Host row plus its Client half.
+# @local/dsh-wrainrock-daemon — one Host row plus its Client half.
 # Every value below is optional; the defaults are shown. Change them here and
 # the plugin rewrites the supervisor/unit files on the next activation.
 - insert:
-    - id: dsh-ian-daemon
-      name: '@local/dsh-ian-daemon'
+    - id: dsh-wrainrock-daemon
+      name: '@local/dsh-wrainrock-daemon'
       config:
         # systemd user units (written to ~/.config/systemd/user)
-        unitName: dsh-ian-daemon.service
-        safeUnitName: dsh-ian-daemon-safemode.service
+        unitName: dsh-wrainrock-daemon.service
+        safeUnitName: dsh-wrainrock-daemon-safemode.service
         # profile that runs normally, and the pristine profile used as safe mode
         safeProfile: dsh-safe
         safeTemplate: web

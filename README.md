@@ -1,35 +1,38 @@
-# dsh-ian-daemon — DeepSeek Harness 的开机自启与看护插件
+# dsh-wrainrock-daemon — DeepSeek Harness 的开机自启与看护插件
 
 一个 Harness 插件（Host 半边 + Client 半边），用 systemd 用户服务实现三件事：
 
 | 需求 | 实现 |
 | --- | --- |
-| 1. systemd 开机自启动 | `dsh-ian-daemon.service`（用户级 unit，无需 root）+ `loginctl enable-linger` 使其在开机（而非登录）时启动 |
+| 1. systemd 开机自启动 | `dsh-wrainrock-daemon.service`（用户级 unit，无需 root）+ `loginctl enable-linger` 使其在开机（而非登录）时启动 |
 | 2. 崩溃 / 损坏自恢复，多次失败进安全模式并汇报 | 看护脚本 `supervisor.sh`：启动前校验配置（损坏则从最近一次正常快照恢复）→ 运行 `dsh` → 统计滚动窗口内的快速失败次数 → 达阈值切换干净的安全 profile `dsh-safe`，写事故报告并弹桌面通知；systemd 的 `OnFailure=` 作为第二道防线。另有两道**环境守卫**：profile+端口级看护锁（同一个 unit 被两个 systemd 用户管理器各拉起一次时，第二个待命而不是再抢端口）、以及「端口已被同类实例占用」识别（记 `peer-port` 报告并等待，**绝不**升级安全模式）；安全模式另用独立端口启动，保证它一定起得来 |
 | 3. 手动“重启”按钮 | Client 半边在输入框下方的 composer dock 中渲染 **重启** 按钮（点两次确认），调用 Host 的 HTTP 接口完成重启 |
 
 ## 项目改名
 
-本项目原名为 `dsh-autostart`，现定名为 **dsh-ian-daemon**。除名称外行为不变，但**已安装的机器会自动迁移**：
+本项目改过两次名：`dsh-autostart` → `dsh-ian-daemon` → 现定名 **dsh-wrainrock-daemon**。除名称外行为不变，但**已安装的机器会自动迁移**（两代旧名都认）：
 
 | 项目 | 旧 | 新 |
 | --- | --- | --- |
-| 包名 / 插件行 | `@local/dsh-autostart` / `dsh-autostart` | `@local/dsh-ian-daemon` / `dsh-ian-daemon` |
-| 主 / 安全模式 / 自测单元 | `dsh-harness.service` 等 | `dsh-ian-daemon.service` / `-safemode` / `-selftest` |
-| 数据目录 | `~/.dsh/autostart` | `~/.dsh/ian-daemon` |
-| 接口前缀 / 请求头 | `/dsh-autostart` / `x-dsh-autostart` | `/dsh-ian-daemon` / `x-dsh-ian-daemon` |
-| 环境变量前缀（测试钩子） | `DSH_AUTOSTART_*` | `DSH_IAN_DAEMON_*` |
+| 包名 / 插件行 | `@local/dsh-autostart`、`@local/dsh-ian-daemon` | `@local/dsh-wrainrock-daemon` |
+| 主 / 安全模式 / 自测单元 | `dsh-harness.service` 等、`dsh-ian-daemon.service` 等 | `dsh-wrainrock-daemon.service` / `-safemode` / `-selftest` |
+| 数据目录 | `~/.dsh/autostart`、`~/.dsh/ian-daemon` | `~/.dsh/wrainrock-daemon` |
+| 接口前缀 / 请求头 | `/dsh-autostart`、`/dsh-ian-daemon` | `/dsh-wrainrock-daemon` / `x-dsh-wrainrock-daemon` |
+| 环境变量前缀（测试钩子） | `DSH_AUTOSTART_*`、`DSH_IAN_DAEMON_*` | `DSH_WRAINROCK_DAEMON_*` |
 
-迁移在插件激活时自动完成：先搬数据目录，再写新单元、`daemon-reload`、**停用并删除旧单元**、启用新单元，
-保证任何时刻只有一个单元处于 enabled（`node tests/migration.mjs` 覆盖了这条路径）。
-只会动带本项目标记的单元；不认识的文件一律不碰。
+迁移在插件激活时自动完成：先把**最新一代存在的那一个**旧数据目录搬进新目录（新目录已存在就完全不动），
+再写新单元、`daemon-reload`、**停用并删除旧单元**、启用新单元，保证任何时刻只有一个单元处于 enabled。
+旧名清单可用 `legacyUnitNames` / `legacyHomeDirs`（单数 `legacyHomeDir` 仍作为显式覆盖生效）改写；
+`node tests/migration.mjs` 对两代旧名各跑一遍（数据搬没搬、旧单元删没删、只有新单元 enabled）。
+只会动带本项目标记（`@local/dsh-wrainrock-daemon` / `@local/dsh-ian-daemon` / `@local/dsh-autostart`）的单元；
+不认识的文件一律不碰。
 
 ## 使用
 
 安装后插件会自动完成安装与启用（`installOnActivate`、`startAtBoot` 默认 `true`）。
 它**不会**立刻启动服务——当前手动运行的实例仍占着端口；下次开机（或点“重启”）时由 systemd 接管。
 
-> 交接注意：**不要**在手动实例还占着端口时直接 `systemctl --user start dsh-ian-daemon.service`，
+> 交接注意：**不要**在手动实例还占着端口时直接 `systemctl --user start dsh-wrainrock-daemon.service`，
 > 那会连续启动失败并升级为安全模式（安全模式是粘性的）。正确做法是点一次「重启」——
 > 助手会等旧进程退出后再 `systemctl --user restart`，不会抢端口；或者先退出手动实例再 start。
 
@@ -39,7 +42,7 @@
   第一次点击变为 `确认重启？`（6 秒内），第二次点击执行；重启中显示 `重启中…`，新进程起来后页面自动刷新。
   上次启动进入过安全模式时，按钮带橙色边框与提示点。
   按钮整体包在 `SafeBoundary` 里：即使花哨版本渲染崩溃，也会退化成不带样式的普通 `重启` 按钮，不会出现空白格。
-  - 若当前进程由 systemd 托管 → `systemctl --user restart dsh-ian-daemon.service`；
+  - 若当前进程由 systemd 托管 → `systemctl --user restart dsh-wrainrock-daemon.service`；
   - 若当前是手动运行 → 派发一个脱离终端的助手脚本，等旧进程退出后接管（已启用自启动则交给 systemd，否则原样重新拉起命令行）。
 
   页面在没有手动刷新的情况下通常会通过客户端 HMR 拿到新代码；若插件刚安装完仍看不到，`Ctrl+Shift+R` 硬刷新一次即可。
@@ -47,25 +50,25 @@
   重启流程本身跑在**模块级**而不是组件里：服务端一断，会话级 slot 会塌、组件会 unmount，
   组件清理绝不能把已经在飞的重启流程掐死。流程规则是「证明页面已经过期才刷新」——
   POST 抛错（服务端先死、响应丢失）不再放弃；服务端 pid 变了、或观测到「断开又回来」就刷新页面；
-  一直没起来则给出提示让你手动刷新。每一步都会回执到 `/dsh-ian-daemon/event`。
+  一直没起来则给出提示让你手动刷新。每一步都会回执到 `/dsh-wrainrock-daemon/event`。
   刷新前会等 harness 自己报告**已就绪**（`appReady`）：在此之前页面真正需要的 `/api` 传输通道还没注册，
   过早刷新会刷进一个连不上后端的壳（这正是 2026-10-06「卡住」的原因）。
   整个交接刻意做薄：`POST /restart` 应答后 **250ms** 就执行（只为让 202 到达浏览器），
   重启期间轮询间隔 **500ms**，按钮上显示 `重启中… Ns` 让你看到进度而不是像卡死。
   本机实测（Bazzite 44 / systemd 259 / DSH 0.2.0-rc.2 / 34 个插件）：`preflight` 0.10s、
   systemd 停+起 <1s、插件挂载→`ready` ≈2.0s，即「点击→服务就绪」≈2.5s；其余是页面重载与 SPA 启动。
-- **状态与日志接口**（仅本机可访问，写操作需带 `x-dsh-ian-daemon: 1` 头）：
+- **状态与日志接口**（仅本机可访问，写操作需带 `x-dsh-wrainrock-daemon: 1` 头）：
 
   ```
-  GET  /dsh-ian-daemon/status       # systemd / 看护 / 事故 / 路径 全量状态
-  GET  /dsh-ian-daemon/log?lines=200&source=dsh
-  POST /dsh-ian-daemon/restart      # 同“重启”按钮
-  POST /dsh-ian-daemon/install      # 重写脚本与 unit、daemon-reload、enable
-  POST /dsh-ian-daemon/uninstall    # 反注册并删除 unit（报告保留）
-  POST /dsh-ian-daemon/repair       # 立刻做一次配置校验/恢复
-  POST /dsh-ian-daemon/reset?restart=1   # 清除安全模式（并可立即重启）
-  POST /dsh-ian-daemon/selftest     # 验证本会话能启停 systemd 用户 unit
-  POST /dsh-ian-daemon/event        # 页面回执（重启生命周期/UI 崩溃），写入 state/client-events.jsonl
+  GET  /dsh-wrainrock-daemon/status       # systemd / 看护 / 事故 / 路径 全量状态
+  GET  /dsh-wrainrock-daemon/log?lines=200&source=dsh
+  POST /dsh-wrainrock-daemon/restart      # 同“重启”按钮
+  POST /dsh-wrainrock-daemon/install      # 重写脚本与 unit、daemon-reload、enable
+  POST /dsh-wrainrock-daemon/uninstall    # 反注册并删除 unit（报告保留）
+  POST /dsh-wrainrock-daemon/repair       # 立刻做一次配置校验/恢复
+  POST /dsh-wrainrock-daemon/reset?restart=1   # 清除安全模式（并可立即重启）
+  POST /dsh-wrainrock-daemon/selftest     # 验证本会话能启停 systemd 用户 unit
+  POST /dsh-wrainrock-daemon/event        # 页面回执（重启生命周期/UI 崩溃），写入 state/client-events.jsonl
   ```
 
   `/status` 里的 `ready` / `readyAt` 表示 harness 是否已完成启动审计，`clientHeartbeat` 是页面轮询心跳
@@ -76,23 +79,23 @@
 ## 生成的文件
 
 ```
-~/.config/systemd/user/dsh-ian-daemon.service            # 开机自启 + 看护（enabled）
-~/.config/systemd/user/dsh-ian-daemon-safemode.service   # OnFailure= 兜底，不随开机启用
-~/.config/systemd/user/default.target.wants/dsh-ian-daemon.service -> ../dsh-ian-daemon.service
-~/.dsh/ian-daemon/bin/supervisor.sh                    # 看护脚本（由插件生成，勿手改）
-~/.dsh/ian-daemon/bin/relaunch.sh                      # 手动实例的接管助手
-~/.dsh/ian-daemon/state/                               # mode / failures / last_exit / incident.json
-~/.dsh/ian-daemon/state/supervisor-<profile>-<port>.lock   # 看护单例锁（flock，进程退出即释放）
-~/.dsh/ian-daemon/backup/                              # 最近一次能正常组合的 profile 配置快照
-~/.dsh/ian-daemon/reports/                             # 事故报告（incident-*.md、latest.md、broken-*/）
-~/.dsh/ian-daemon/logs/                                # supervisor.log 与 dsh.out.log
+~/.config/systemd/user/dsh-wrainrock-daemon.service            # 开机自启 + 看护（enabled）
+~/.config/systemd/user/dsh-wrainrock-daemon-safemode.service   # OnFailure= 兜底，不随开机启用
+~/.config/systemd/user/default.target.wants/dsh-wrainrock-daemon.service -> ../dsh-wrainrock-daemon.service
+~/.dsh/wrainrock-daemon/bin/supervisor.sh                    # 看护脚本（由插件生成，勿手改）
+~/.dsh/wrainrock-daemon/bin/relaunch.sh                      # 手动实例的接管助手
+~/.dsh/wrainrock-daemon/state/                               # mode / failures / last_exit / incident.json
+~/.dsh/wrainrock-daemon/state/supervisor-<profile>-<port>.lock   # 看护单例锁（flock，进程退出即释放）
+~/.dsh/wrainrock-daemon/backup/                              # 最近一次能正常组合的 profile 配置快照
+~/.dsh/wrainrock-daemon/reports/                             # 事故报告（incident-*.md、latest.md、broken-*/）
+~/.dsh/wrainrock-daemon/logs/                                # supervisor.log 与 dsh.out.log
 ```
 
 开机后 GUI 地址（带 token）写在启动日志里：
 
 ```bash
-systemctl --user status dsh-ian-daemon.service
-grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/ian-daemon/logs/dsh.out.log | tail -1
+systemctl --user status dsh-wrainrock-daemon.service
+grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.out.log | tail -1
 ```
 
 ## 恢复阶梯
@@ -103,11 +106,11 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/ian-daemon/logs/dsh.out.lo
 3. **安全模式**：首次使用时用官方模板创建 `dsh-safe` profile（只含随 dsh 发布的 bundle），随后一直用它启动；**安全模式是粘性的**，需要显式复位。安全模式默认监听 `safePort`（主端口 + 1），这样即使常规 profile 的实例还占着主端口，安全模式也能起来：
 
    ```bash
-   curl -X POST -H 'x-dsh-ian-daemon: 1' 'http://127.0.0.1:3080/dsh-ian-daemon/reset?restart=1'
-   # 或：rm -f ~/.dsh/ian-daemon/state/{mode,failures} && systemctl --user restart dsh-ian-daemon.service
+   curl -X POST -H 'x-dsh-wrainrock-daemon: 1' 'http://127.0.0.1:3080/dsh-wrainrock-daemon/reset?restart=1'
+   # 或：rm -f ~/.dsh/wrainrock-daemon/state/{mode,failures} && systemctl --user restart dsh-wrainrock-daemon.service
    ```
-4. **汇报**：写 `reports/incident-<时间>.md` + `state/incident.json`，并发 `notify-send` 桌面通知（`notify` 可关）；`/dsh-ian-daemon/status` 会把事故回传给按钮。
-5. **systemd 第二道防线**：若看护脚本自身反复死掉（`StartLimitBurst=5/90s`），主 unit 进入 failed 并触发 `dsh-ian-daemon-safemode.service`，它用 `--force-safe` 启动安全模式并同样写报告。
+4. **汇报**：写 `reports/incident-<时间>.md` + `state/incident.json`，并发 `notify-send` 桌面通知（`notify` 可关）；`/dsh-wrainrock-daemon/status` 会把事故回传给按钮。
+5. **systemd 第二道防线**：若看护脚本自身反复死掉（`StartLimitBurst=5/90s`），主 unit 进入 failed 并触发 `dsh-wrainrock-daemon-safemode.service`，它用 `--force-safe` 启动安全模式并同样写报告。
 
 ## 配置（profile 的 `cordis.patch.yml` 该行 `config`）
 
@@ -122,8 +125,8 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/ian-daemon/logs/dsh.out.lo
 ## 卸载
 
 ```bash
-curl -X POST -H 'x-dsh-ian-daemon: 1' http://127.0.0.1:3080/dsh-ian-daemon/uninstall
-rm -rf ~/.dsh/ian-daemon              # 需要时连报告一起删
+curl -X POST -H 'x-dsh-wrainrock-daemon: 1' http://127.0.0.1:3080/dsh-wrainrock-daemon/uninstall
+rm -rf ~/.dsh/wrainrock-daemon              # 需要时连报告一起删
 loginctl disable-linger "$USER"      # 若不再需要免登录启动
 ```
 
@@ -141,16 +144,16 @@ bash tests/ladder.sh
 
 ## 修复记录
 
-**2026-10-15 — 「疑似进了安全模式，但不是本项目进的」**。现场：`~/.dsh/ian-daemon/state/mode` 为 `safe`、事故类型是 `safe-mode`，而 `preflight` 一直 ok、`preflight.err` 为空——也就是说 `web` profile 本身没坏。子进程的真实退出原因是
+**2026-10-15 — 「疑似进了安全模式，但不是本项目进的」**。现场：`~/.dsh/wrainrock-daemon/state/mode` 为 `safe`、事故类型是 `safe-mode`，而 `preflight` 一直 ok、`preflight.err` 为空——也就是说 `web` profile 本身没坏。子进程的真实退出原因是
 `listen EADDRINUSE: address already in use 127.0.0.1:3080`。
 
 根因不在 profile，而在环境：这台机器上同一个账号同时存在**两个 systemd 用户管理器**——
-`user@1000.service`（slice `user-1000.slice`，logind 记录的正主、`Linger=yes`）和 `user@ian.service`（slice `user-ian.slice`，登录 / `su -m` 那条路拉起来的）。`dsh-ian-daemon.service` 是 enabled 的，于是**两个管理器各启动了一份**：两个 `supervisor.sh`、两个 `dsh web --port 3080`。先抢到端口的活着，另一份 2 秒内以 1 退出；看护脚本把它读成「profile web 起不来」，3 次快速失败后升级到粘性安全模式。更糟的是旧版安全模式沿用同一个 `--port 3080`，两份实例于是继续为一个端口互抢：赢的那份常驻 `dsh-safe`，输的那份每 120s 空转一次，`mode`/`failures` 还被两份看护互相覆盖，永久卡死。这也解释了为什么插件自己的「复位并重启」按钮救不回来——它所在的进程走 `user@ian.service` 的 bus，`systemctl --user restart` 重启的是**输的那一份** unit，占着端口的那份不会被停掉。
+`user@1000.service`（slice `user-1000.slice`，logind 记录的正主、`Linger=yes`）和 `user@ian.service`（slice `user-ian.slice`，登录 / `su -m` 那条路拉起来的）。`dsh-wrainrock-daemon.service` 是 enabled 的，于是**两个管理器各启动了一份**：两个 `supervisor.sh`、两个 `dsh web --port 3080`。先抢到端口的活着，另一份 2 秒内以 1 退出；看护脚本把它读成「profile web 起不来」，3 次快速失败后升级到粘性安全模式。更糟的是旧版安全模式沿用同一个 `--port 3080`，两份实例于是继续为一个端口互抢：赢的那份常驻 `dsh-safe`，输的那份每 120s 空转一次，`mode`/`failures` 还被两份看护互相覆盖，永久卡死。这也解释了为什么插件自己的「复位并重启」按钮救不回来——它所在的进程走 `user@ian.service` 的 bus，`systemctl --user restart` 重启的是**输的那一份** unit，占着端口的那份不会被停掉。
 
 现在三层都堵上了（`tests/ladder.sh` 第 13–15 组断言锁住）：
 
 1. **看护单例锁**：`state/supervisor-<profile>-<port>.lock`（`flock`，进程退出自动释放）。同一 profile+端口只允许一个看护脚本运行；第二个进待命循环，持有者退出后接管。它不会启动第二个 dsh，也不会把同伴的端口算成自己的失败。
-2. **同伴端口识别**：启动前若端口已被同类实例持有（`/proc/*/cmdline` 里带该端口的 dsh 进程，或对端能应答本插件的 `/dsh-ian-daemon/status`），就写一条 `peer-port` 报告并等待，**不计失败、不升级**；端口竞争的失败在子进程退出后也会被同样归类。
+2. **同伴端口识别**：启动前若端口已被同类实例持有（`/proc/*/cmdline` 里带该端口的 dsh 进程，或对端能应答本插件的 `/dsh-wrainrock-daemon/status`），就写一条 `peer-port` 报告并等待，**不计失败、不升级**；端口竞争的失败在子进程退出后也会被同样归类。
 3. **安全模式独立端口**：安全模式默认监听 `safePort`（主端口 + 1），不会再和常规 profile 抢同一个端口；`safePort`、`portGuard` 可配置。
 
 另外插件现在会**检测重复的用户管理器**：`/status.managers`、安装结果 `warnings`、看护启动日志与事故报告的 `## Environment` 小节都会指出「N 个 systemd 用户管理器」并给出建议。守卫能让这个故障不再发生，但重复的管理器本身是环境问题，值得单独清掉（`loginctl list-sessions` 看 CLASS 为 `manager` 的那几个，多出来的那个通常来自多余的登录方式或 linger 配置；`loginctl list-sessions` 没有 `--class` 选项，看护脚本与插件都是在输出里匹配 CLASS 列）。
@@ -190,10 +193,11 @@ bash tests/ladder.sh
 
 已在本机（Bazzite 44 / systemd 259 / DSH 0.2.0-rc.2）实测通过：
 
-- 插件行激活、Client slot 注册（`conversation.composer.dock` 与 `sidebar.footer.action` 中 `dsh-ian-daemon`，active）；
+- 插件行激活、Client slot 注册（`conversation.composer.dock` 与 `sidebar.footer.action` 中 `dsh-wrainrock-daemon`，active）；
 - HTTP 接口：`/status`、`/repair`、`/selftest`（真实启停 systemd 用户 unit）、`/mounted`，写操作鉴权（无头 403、GET 405）；
 - unit 语法 `systemd-analyze --user verify`、`systemctl --user is-enabled` = `enabled`、`loginctl` linger；
-- 看护阶梯 **11 组断言全绿**（`bash tests/ladder.sh`）+ 改名迁移测试；
+- 看护阶梯 **16 组断言全绿**（`bash tests/ladder.sh`，含「冗余用户管理器时第二个看护待命」「安全模式走独立端口」两组新断言）
+  + 改名迁移测试（`node tests/migration.mjs`，对 `dsh-ian-daemon` 与 `dsh-autostart` 两代旧名各跑一遍）；
 - 用与 `ExecStart` 完全相同的命令行真实启动过 Harness；
 - **真实重启电脑后自动起来**（开机 15 秒内拉起，无需登录），关机时看护脚本干净退出；
 - 手动「重启」按钮点击后成功由 systemd 接管。
@@ -203,7 +207,7 @@ bash tests/ladder.sh
 ## 安装（从 GitHub）
 
 ```bash
-dsh plugin --profile web add github:Grant-Felix/dsh-ian-daemon
+dsh plugin --profile web add github:Grant-Felix/dsh-wrainrock-daemon
 ```
 
 或在 Harness 的插件管理页里用同一 spec 安装。装好后插件会自动写 unit、enable 并开启 linger；
@@ -217,5 +221,5 @@ MIT © 2026 Grant-Felix — 见 [LICENSE](LICENSE)。
 
 - 服务绑定默认回环地址；`dsh web` 的 GUI 需要带 token 的 URL，见上文日志取法。
 - 服务在开机时若端口被**非本项目的**进程占用，仍会按快速失败计数升级到安全模式（此时安全模式用 `safePort` 启动，依然可用）；若占用者是**本项目的另一个实例**，则认定成同伴、等待它退出，绝不会因此升级。
-- 只接管自己写过的 unit：若 `~/.config/systemd/user/dsh-ian-daemon.service` 已存在且不含本插件标记，会先备份为 `*.pre-dsh-ian-daemon` 再覆盖。
+- 只接管自己写过的 unit：若 `~/.config/systemd/user/dsh-wrainrock-daemon.service` 已存在且不含本插件标记，会先备份为 `*.pre-dsh-wrainrock-daemon` 再覆盖。
 - `package.json` 里的 `private: true` 只用于避免误发到 npm registry；从 GitHub 安装不受影响，要发布到 npm 时删掉它即可。

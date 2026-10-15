@@ -40,7 +40,7 @@ const plugin = registration.factory((spec) => {
   if (spec === 'react') return ReactStub
   throw new Error(`unexpected module request: ${spec}`)
 })
-check('registers the documented entry id', '@local/dsh-ian-daemon', registration.id)
+check('registers the documented entry id', '@local/dsh-wrainrock-daemon', registration.id)
 check('exposes the restart test seam', 'function', typeof plugin.__test?.createRestartFlow)
 
 const { createRestartFlow, decideAfterPoll } = plugin.__test

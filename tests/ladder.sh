@@ -17,7 +17,7 @@ set -uo pipefail
 
 # The port guards are exercised explicitly in section 13+; every earlier section
 # only ever runs stub children on port 3999, which is never really bound.
-export DSH_IAN_DAEMON_PORT_GUARD=0
+export DSH_WRAINROCK_DAEMON_PORT_GUARD=0
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH="$PLUGIN_DIR/.selftest"
@@ -36,7 +36,7 @@ render() {
       -e "s|@@PORT@@|3999|g" \
       -e "s|@@SAFE_PORT@@|4000|g" \
       -e "s|@@PORT_GUARD@@|1|g" \
-      -e "s|@@UNIT_NAME@@|dsh-ian-daemon.service|g" \
+      -e "s|@@UNIT_NAME@@|dsh-wrainrock-daemon.service|g" \
       -e "s|@@FAIL_WINDOW@@|600|g" \
       -e "s|@@FAIL_THRESHOLD@@|3|g" \
       -e "s|@@HEALTHY_SECONDS@@|1|g" \
@@ -85,7 +85,7 @@ EOF
 
 echo "1. rapid crash loop escalates to safe mode"
 prepare
-DSH_IAN_DAEMON_EXEC="$SCRATCH/fail.sh" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+DSH_WRAINROCK_DAEMON_EXEC="$SCRATCH/fail.sh" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
   bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
 SUP=$!
 await '[ "$(cat "$SCRATCH/home/state/mode" 2>/dev/null)" = safe ]' 30
@@ -100,7 +100,7 @@ prepare
 printf '2' >"$SCRATCH/home/state/failures"
 printf '%s' "$(date +%s)" >"$SCRATCH/home/state/window_start"
 printf 'normal' >"$SCRATCH/home/state/mode"
-DSH_IAN_DAEMON_EXEC="$SCRATCH/healthy.sh" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+DSH_WRAINROCK_DAEMON_EXEC="$SCRATCH/healthy.sh" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
   bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
 SUP=$!
 await '[ "$(cat "$SCRATCH/home/state/failures" 2>/dev/null)" = 0 ]' 20
@@ -110,7 +110,7 @@ check "failures reset" "0" "$(cat "$SCRATCH/home/state/failures" 2>/dev/null)"
 
 echo "3. a clean exit is restarted, never treated as a stop"
 prepare
-DSH_IAN_DAEMON_EXEC="$SCRATCH/clean.sh" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+DSH_WRAINROCK_DAEMON_EXEC="$SCRATCH/clean.sh" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
   timeout -s TERM 8 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1
 check "supervisor kept running until the timeout" "124" "$?"
 check "it restarted instead of stopping" "yes" \
@@ -121,7 +121,7 @@ prepare
 mkdir -p "$SCRATCH/home/backup"
 printf 'good-config\n' >"$SCRATCH/home/backup/cordis.patch.yml"
 printf 'BROKEN-CONFIG\n' >"$SCRATCH/dshhome/profiles/web/cordis.patch.yml"
-DSH_IAN_DAEMON_EXEC="$SCRATCH/clean.sh" timeout -s TERM 8 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1
+DSH_WRAINROCK_DAEMON_EXEC="$SCRATCH/clean.sh" timeout -s TERM 8 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1
 check "profile config restored" "good-config" "$(cat "$SCRATCH/dshhome/profiles/web/cordis.patch.yml" 2>/dev/null)"
 check "broken config quarantined" "1" "$(ls -1d "$SCRATCH/home/reports"/broken-* 2>/dev/null | wc -l)"
 
@@ -133,15 +133,15 @@ check "helper exit code" "0" "$?"
 check "command was re-executed" "relaunched" "$(cat "$SCRATCH/relaunch-ok" 2>/dev/null)"
 
 echo "6. the relaunch helper fails fast when systemd cannot restart the unit"
-bash "$PLUGIN_DIR/relaunch.sh" 1 systemd dsh-ian-daemon-does-not-exist.service "" /bin/true
+bash "$PLUGIN_DIR/relaunch.sh" 1 systemd dsh-wrainrock-daemon-does-not-exist.service "" /bin/true
 check "helper exit code" "1" "$?"
 
 echo "7. an instant exit 0 is a failed start, not a clean stop"
 prepare
 printf '#!/bin/bash\nsleep 0.2\nexit 0\n' >"$SCRATCH/exit0.sh"
 chmod +x "$SCRATCH/exit0.sh"
-DSH_IAN_DAEMON_EXEC="$SCRATCH/exit0.sh" DSH_IAN_DAEMON_HEALTHY_SECONDS=5 \
-  DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+DSH_WRAINROCK_DAEMON_EXEC="$SCRATCH/exit0.sh" DSH_WRAINROCK_DAEMON_HEALTHY_SECONDS=5 \
+  DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
   bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
 SUP=$!
 await '[ "$(cat "$SCRATCH/home/state/mode" 2>/dev/null)" = safe ]' 30
@@ -156,8 +156,8 @@ check "incident kind" "safe-mode" \
 echo "8. an unusable generated command line is reported and never launched"
 prepare
 HOME="$SCRATCH/nohome" PATH=/usr/bin:/bin \
-  DSH_IAN_DAEMON_NODE=/nonexistent/node DSH_IAN_DAEMON_CLI=/nonexistent/bin.js \
-  DSH_IAN_DAEMON_NOTIFY=0 DSH_IAN_DAEMON_MAX_BACKOFF=1 \
+  DSH_WRAINROCK_DAEMON_NODE=/nonexistent/node DSH_WRAINROCK_DAEMON_CLI=/nonexistent/bin.js \
+  DSH_WRAINROCK_DAEMON_NOTIFY=0 DSH_WRAINROCK_DAEMON_MAX_BACKOFF=1 \
   timeout -s TERM 5 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1
 LAUNCHED="$(grep -c 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null | head -1)"
 check "nothing was launched" "0" "${LAUNCHED:-0}"
@@ -172,8 +172,8 @@ printf '#!/bin/bash\nexec /bin/bash "$@"\n' >"$FAKE/bin/node"
 printf '#!/bin/bash\necho "fake dsh cli ran: $*" >>"%s"\nexit 0\n' "$SCRATCH/cli-ran.txt" >"$FAKE/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
 chmod +x "$FAKE/bin/node" "$FAKE/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
 HOME="$SCRATCH/fakehome" PATH=/usr/bin:/bin \
-  DSH_IAN_DAEMON_NODE=/nonexistent/node DSH_IAN_DAEMON_CLI=/nonexistent/bin.js \
-  DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 DSH_IAN_DAEMON_HEALTHY_SECONDS=0 \
+  DSH_WRAINROCK_DAEMON_NODE=/nonexistent/node DSH_WRAINROCK_DAEMON_CLI=/nonexistent/bin.js \
+  DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 DSH_WRAINROCK_DAEMON_HEALTHY_SECONDS=0 \
   timeout -s TERM 5 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1
 check "repaired from the installed layout" "yes" \
   "$(grep -q 'runtime repaired' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
@@ -182,7 +182,7 @@ check "the repaired command really ran" "yes" \
 
 echo "10. a stop signal (systemctl stop) ends the supervisor promptly"
 prepare
-DSH_IAN_DAEMON_EXEC="sleep 30" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
   bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
 SUP=$!
 sleep 1
@@ -192,7 +192,7 @@ check "supervisor exit code" "0" "$?"
 check "logged the stop" "yes" \
   "$(grep -q 'stop requested\|stopped by signal' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
 
-echo "11. rename migration (a legacy dsh-autostart install -> dsh-ian-daemon)"
+echo "11. rename migration (a legacy dsh-autostart install -> dsh-wrainrock-daemon)"
 if command -v node >/dev/null 2>&1; then
   if node "$PLUGIN_DIR/tests/migration.mjs" >"$SCRATCH/migration.log" 2>&1; then
     check "migration test" "passed" "passed"
@@ -224,8 +224,8 @@ if command -v node >/dev/null 2>&1; then
   bash "$SCRATCH/peer/bin.js" --port 3999 &
   PEER=$!
   await 'ss -ltnH "sport = :3999" 2>/dev/null | grep -q .' 5
-  DSH_IAN_DAEMON_PORT_GUARD=1 DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
-    DSH_IAN_DAEMON_STANDBY_POLL=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+  DSH_WRAINROCK_DAEMON_PORT_GUARD=1 DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
+    DSH_WRAINROCK_DAEMON_STANDBY_POLL=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
   SUP=$!
   await 'grep -q "peer instance owns port" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
   kill -TERM "$SUP" 2>/dev/null; wait "$SUP" 2>/dev/null
@@ -244,12 +244,12 @@ fi
 
 echo "14. a second supervisor on the same profile+port stands by on the lock"
 prepare
-DSH_IAN_DAEMON_EXEC="sleep 30" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
   bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
 SUP1=$!
 await 'grep -q "supervisor started" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
-DSH_IAN_DAEMON_EXEC="sleep 30" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
-  DSH_IAN_DAEMON_STANDBY_POLL=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
+  DSH_WRAINROCK_DAEMON_STANDBY_POLL=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
 SUP2=$!
 await 'grep -q "standby: another supervisor" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
 STARTS="$(grep -c 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null | head -1)"
@@ -273,8 +273,8 @@ if command -v node >/dev/null 2>&1; then
   bash "$SCRATCH/peer/bin.js" --port 3999 &
   PEER=$!
   await 'ss -ltnH "sport = :3999" 2>/dev/null | grep -q .' 5
-  DSH_IAN_DAEMON_EXEC="$SCRATCH/eaddrinuse.sh" DSH_IAN_DAEMON_HEALTHY_SECONDS=5 \
-    DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 DSH_IAN_DAEMON_STANDBY_POLL=1 \
+  DSH_WRAINROCK_DAEMON_EXEC="$SCRATCH/eaddrinuse.sh" DSH_WRAINROCK_DAEMON_HEALTHY_SECONDS=5 \
+    DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 DSH_WRAINROCK_DAEMON_STANDBY_POLL=1 \
     bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
   SUP=$!
   await 'grep -q "not counted as a profile failure" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 20
@@ -293,7 +293,7 @@ prepare
 printf 'safe\n' >"$SCRATCH/home/state/mode"
 mkdir -p "$SCRATCH/dshhome/profiles/dsh-safe"
 printf '{}' >"$SCRATCH/dshhome/profiles/dsh-safe/package.json"
-DSH_IAN_DAEMON_EXEC="sleep 30" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 \
+DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 \
   bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
 SUP=$!
 await 'grep -q "start mode=safe" "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null' 15
