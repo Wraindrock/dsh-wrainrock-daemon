@@ -153,7 +153,7 @@ bash tests/ladder.sh
 2. **同伴端口识别**：启动前若端口已被同类实例持有（`/proc/*/cmdline` 里带该端口的 dsh 进程，或对端能应答本插件的 `/dsh-ian-daemon/status`），就写一条 `peer-port` 报告并等待，**不计失败、不升级**；端口竞争的失败在子进程退出后也会被同样归类。
 3. **安全模式独立端口**：安全模式默认监听 `safePort`（主端口 + 1），不会再和常规 profile 抢同一个端口；`safePort`、`portGuard` 可配置。
 
-另外插件现在会**检测重复的用户管理器**：`/status.managers`、安装结果 `warnings`、看护启动日志与事故报告的 `## Environment` 小节都会指出「N 个 systemd 用户管理器」并给出建议。守卫能让这个故障不再发生，但重复的管理器本身是环境问题，值得单独清掉（`loginctl list-sessions --class=manager` 看有哪几个，多出来的那个通常来自多余的登录方式或 linger 配置）。
+另外插件现在会**检测重复的用户管理器**：`/status.managers`、安装结果 `warnings`、看护启动日志与事故报告的 `## Environment` 小节都会指出「N 个 systemd 用户管理器」并给出建议。守卫能让这个故障不再发生，但重复的管理器本身是环境问题，值得单独清掉（`loginctl list-sessions` 看 CLASS 为 `manager` 的那几个，多出来的那个通常来自多余的登录方式或 linger 配置；`loginctl list-sessions` 没有 `--class` 选项，看护脚本与插件都是在输出里匹配 CLASS 列）。
 
 **2026-10-05 — "点重启后关掉但没起来"**。根因有两层：
 

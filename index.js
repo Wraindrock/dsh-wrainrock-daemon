@@ -523,14 +523,29 @@ export function createManager(ctx, rawConfig) {
    * reportable one (the supervisor also guards against it at runtime).
    */
   async function userManagers() {
-    const result = await run('loginctl', ['list-sessions', '--class=manager', '--no-legend'])
-    if (result.code !== 0) return { known: false, count: 0, ids: [], duplicate: false }
     const uid = String(typeof process.getuid === 'function' ? process.getuid() : '')
     const ids = []
-    for (const line of result.stdout.split('\n')) {
-      const fields = line.trim().split(/\s+/)
-      if (fields.length < 4 || fields[0] === '') continue
-      if (fields[1] === uid || fields[2] === userName) ids.push(fields[0])
+    // Preferred source: the user manager units systemd itself reports. This also
+    // catches a manager that never registered a logind session.
+    const units = await run('systemctl', ['list-units', '--all', '--no-legend', '--plain', '--no-pager', 'user@*.service'])
+    if (units.code === 0) {
+      for (const line of units.stdout.split('\n')) {
+        const name = line.trim().split(/\s+/)[0] ?? ''
+        const instance = /^user@(.+)\.service$/.exec(name)?.[1]
+        if (instance !== undefined && (instance === uid || instance === userName)) ids.push(name)
+      }
+    }
+    if (ids.length === 0) {
+      // Fallback: manager *sessions*. `loginctl list-sessions` has no --class
+      // option (systemd 262 rejects it), so its CLASS column is matched instead.
+      const sessions = await run('loginctl', ['list-sessions', '--no-legend'])
+      if (sessions.code !== 0) return { known: false, count: 0, ids: [], duplicate: false }
+      for (const line of sessions.stdout.split('\n')) {
+        const fields = line.trim().split(/\s+/)
+        if (fields.length < 4 || fields[0] === '') continue
+        if (!fields.includes('manager')) continue
+        if (fields[1] === uid || fields[2] === userName) ids.push(fields[0])
+      }
     }
     return {
       known: true,

@@ -201,8 +201,10 @@ manager_sessions() {
   local uid
   uid="$(id -u 2>/dev/null || true)"
   command -v loginctl >/dev/null 2>&1 || return 1
-  loginctl list-sessions --class=manager --no-legend 2>/dev/null |
-    awk -v uid="$uid" '$2 == uid { n++ } END { print n + 0 }'
+  # `loginctl list-sessions` has no --class option (systemd 262 rejects it), so
+  # the CLASS column is matched here instead.
+  loginctl list-sessions --no-legend 2>/dev/null |
+    awk -v uid="$uid" '$2 == uid { for (i = 1; i <= NF; i++) if ($i == "manager") { n++; break } } END { print n + 0 }'
 }
 
 # Do not spam a report on every retry: same one-per-window trick as the runtime
