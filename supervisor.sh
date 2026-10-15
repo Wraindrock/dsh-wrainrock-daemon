@@ -19,6 +19,21 @@
 #  Safe mode is sticky: it stays until it is explicitly reset (the plugin's
 #  "复位并重启" action, or by deleting <state>/mode and restarting the unit).
 #
+#  Two guards keep the ladder from firing on an *environment* problem instead of
+#  a broken profile. Real incident (2026-10-15): one account had two systemd
+#  user managers (`user@1000.service` and `user@ian.service`), both started this
+#  unit, the port loser saw EADDRINUSE, the ladder read that as "the profile
+#  cannot boot" and switched to the sticky safe profile — which then fought for
+#  the very same port forever, so the machine was stuck in safe mode.
+#
+#    * one supervisor per profile+port holds an flock; a second one (a duplicate
+#      manager, a hand-started copy) stands by, takes over when the holder is
+#      gone, and never counts the peer as a failure of its own
+#    * a port already owned by another DSH of ours means "the service is already
+#      up, owned by a peer": reported as kind `peer-port` and waited out, never
+#      escalated. Safe mode also listens on its own port, so it can always come
+#      up even while the normal profile still holds the main one.
+#
 #  Every DSH_IAN_DAEMON_* value below can be overridden from the environment, so
 #  the whole ladder can be exercised without touching the real profile.
 # =============================================================================
@@ -33,6 +48,13 @@ PROFILE="${DSH_IAN_DAEMON_PROFILE:-@@PROFILE@@}"
 SAFE_PROFILE="${DSH_IAN_DAEMON_SAFE_PROFILE:-@@SAFE_PROFILE@@}"
 SAFE_TEMPLATE="${DSH_IAN_DAEMON_SAFE_TEMPLATE:-@@SAFE_TEMPLATE@@}"
 APP_ARGS="${DSH_IAN_DAEMON_APP_ARGS:-@@APP_ARGS@@}"
+SAFE_APP_ARGS="${DSH_IAN_DAEMON_SAFE_APP_ARGS:-@@SAFE_APP_ARGS@@}"
+# Baked as values of their own (never parsed back out of APP_ARGS) so the port
+# guards below can never disagree with the command line actually launched.
+PORT="${DSH_IAN_DAEMON_PORT:-@@PORT@@}"
+SAFE_PORT="${DSH_IAN_DAEMON_SAFE_PORT:-@@SAFE_PORT@@}"
+PORT_GUARD="${DSH_IAN_DAEMON_PORT_GUARD:-@@PORT_GUARD@@}"
+STANDBY_POLL="${DSH_IAN_DAEMON_STANDBY_POLL:-5}"
 UNIT_NAME="${DSH_IAN_DAEMON_UNIT:-@@UNIT_NAME@@}"
 FAIL_WINDOW="${DSH_IAN_DAEMON_FAIL_WINDOW:-@@FAIL_WINDOW@@}"
 FAIL_THRESHOLD="${DSH_IAN_DAEMON_FAIL_THRESHOLD:-@@FAIL_THRESHOLD@@}"
@@ -111,6 +133,108 @@ rotate_logs() {  if [ -f "$LOG" ] && [ "$(wc -l <"$LOG" 2>/dev/null || echo 0)" 
   done
 }
 
+# --- singleton lock + peer awareness -----------------------------------------
+# Two systemd *user managers* for one account (for example user@1000.service AND
+# user@ian.service) both start this unit, so two supervisors race for one
+# profile and one port. Whoever loses the port must not call it a profile
+# failure: the service is up, it is simply owned by the peer.
+LOCK_FILE="$STATE_DIR/supervisor-$PROFILE-${PORT:-0}.lock"
+LOCK_OPENED=0
+
+# Hold fd 9 for the whole process lifetime: flock(1) drops it when we exit, so a
+# crashed supervisor can never leave a stale lock behind.
+lock_open() {
+  [ "$LOCK_OPENED" = "1" ] && return 0
+  command -v flock >/dev/null 2>&1 || return 1
+  exec 9>>"$LOCK_FILE" 2>/dev/null || return 1
+  LOCK_OPENED=1
+}
+
+lock_try() {
+  lock_open || return 0   # no flock(1) at all: behave exactly as before
+  flock -n 9 2>/dev/null
+}
+
+port_busy() { # port
+  local port="${1:-0}"
+  [ "${port:-0}" -gt 0 ] 2>/dev/null || return 1
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "sport = :$port" 2>/dev/null | grep -q . && return 0
+  fi
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
+  return 1
+}
+
+# PIDs of another DSH process whose command line names this port.
+port_owner_pids() { # port
+  local port="${1:-0}" entry pid cmd found=""
+  [ "${port:-0}" -gt 0 ] 2>/dev/null || return 0
+  for entry in /proc/[0-9]*; do
+    pid="${entry#/proc/}"
+    [ "$pid" = "$$" ] && continue
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || continue
+    case "$cmd" in
+      *bin.js*"--port $port"*|*bin.js*"--port=$port"*) found="$found $pid" ;;
+      *dsh*"--port $port"*|*dsh*"--port=$port"*) found="$found $pid" ;;
+    esac
+  done
+  printf '%s' "${found# }"
+}
+
+# The strongest proof that the port is served by a healthy harness of ours: the
+# peer answers this very plugin's status route (GET only, loopback only).
+peer_serves_http() { # port
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsS -m 2 -o /dev/null -H 'x-dsh-ian-daemon: 1' \
+    "http://127.0.0.1:$1/dsh-ian-daemon/status" 2>/dev/null
+}
+
+peer_owns_port() { # port
+  local port="${1:-0}"
+  port_busy "$port" || return 1
+  [ -n "$(port_owner_pids "$port")" ] && return 0
+  peer_serves_http "$port" && return 0
+  return 1
+}
+
+manager_sessions() {
+  local uid
+  uid="$(id -u 2>/dev/null || true)"
+  command -v loginctl >/dev/null 2>&1 || return 1
+  loginctl list-sessions --class=manager --no-legend 2>/dev/null |
+    awk -v uid="$uid" '$2 == uid { n++ } END { print n + 0 }'
+}
+
+# Do not spam a report on every retry: same one-per-window trick as the runtime
+# fix. Note the kind: `peer-port`, never `safe-mode`.
+report_peer_port() { # port
+  local port="$1" marker="$STATE_DIR/peer-port.reported" age=999999 owners
+  [ -f "$marker" ] && age=$(( $(now) - $(read_state "$marker" 0) ))
+  owners="$(port_owner_pids "$port")"
+  if [ "$age" -gt "$FAIL_WINDOW" ]; then
+    write_state "$marker" "$(now)"
+    write_incident "peer-port" "Port $port is already owned by another DeepSeek Harness instance of this autostart${owners:+ (pid $owners)}. That is not a failure of the '$PROFILE' profile, so this unit keeps '$PROFILE' selected and waits for the peer to exit instead of escalating to safe mode. This usually means two supervisors are running at once: two systemd user managers for one account, or a hand-started 'dsh web' that still holds the port."
+    notify normal "端口 $port 已被另一个 Harness 实例占用（同伴实例）；保持 $PROFILE 并等待它退出，不会进入安全模式。"
+  fi
+  log "peer instance owns port $port; standing by (not counted as a profile failure)"
+}
+
+# Was the attempt that just ended killed by a peer holding the port? Only then is
+# a rapid exit evidence about the *environment* rather than about the profile.
+last_attempt_port_conflict() { # port
+  local port="$1" attempt
+  [ "${port:-0}" -gt 0 ] 2>/dev/null || return 1
+  [ -f "$OUT_LOG" ] || return 1
+  attempt="$(awk '/\[supervisor\] start mode=/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$OUT_LOG" 2>/dev/null)"
+  case "$attempt" in
+    *EADDRINUSE*"$port"*|*"address already in use"*"$port"*) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$(port_owner_pids "$port")" ] && return 0
+  peer_serves_http "$port" && return 0
+  return 1
+}
+
 # --- state snapshot / restore ------------------------------------------------
 snapshot_config() {
   [ -d "$PROFILE_DIR" ] || return 0
@@ -144,6 +268,9 @@ quarantine_config() {
 }
 
 # --- reporting ---------------------------------------------------------------
+# Collected once at startup: why this machine is not a plain single-manager box.
+env_note=""
+
 write_incident() { # kind message
   local kind="$1" message="$2" ts
   ts="$(stamp)"
@@ -160,6 +287,9 @@ JSON
     printf -- '- profile: `%s`   safe profile: `%s`\n' "$PROFILE" "$SAFE_PROFILE"
     printf -- '- report dir: `%s`\n\n' "$REPORT_DIR"
     printf '## What happened\n\n%s\n\n' "$message"
+    if [ -n "$env_note" ]; then
+      printf '## Environment\n\n%s\n\n' "$env_note"
+    fi
     printf '## Leaving safe mode\n\n```\n'
     printf 'rm -f %s/mode %s/failures\n' "$STATE_DIR" "$STATE_DIR"
     printf 'systemctl --user restart %s\n' "$UNIT_NAME"
@@ -264,22 +394,52 @@ ensure_safe_profile() {
 }
 
 # --- main loop ---------------------------------------------------------------
-failures="$(read_state "$STATE_DIR/failures" 0)"
-window_start="$(read_state "$STATE_DIR/window_start" 0)"
-last_exit="$(read_state "$STATE_DIR/last_exit" 0)"
 uptime=0
 stop=0
 mode=normal
+trap 'stop=1' TERM INT
+
+read -r -a APP_ARGV <<<"$APP_ARGS"
+read -r -a SAFE_APP_ARGV <<<"$SAFE_APP_ARGS"
+
+# Only one supervisor may own this profile+port. A second one (typically the
+# same unit started by a second systemd user manager) stands by here and takes
+# over once the holder is gone: it must never start a second dsh on the same
+# port, and it must never count the peer's port as a failure of its own.
+if ! lock_try; then
+  log "standby: another supervisor for profile '$PROFILE' port ${PORT:-0} holds $LOCK_FILE; waiting for it to exit"
+  while [ "$stop" = "0" ]; do
+    interruptible_sleep "$STANDBY_POLL"
+    lock_try && break
+  done
+  if [ "$stop" = "1" ]; then
+    log "standby: stop requested; exiting"
+    exit 0
+  fi
+  log "standby: lock acquired; taking over profile '$PROFILE'"
+fi
+
+failures="$(read_state "$STATE_DIR/failures" 0)"
+window_start="$(read_state "$STATE_DIR/window_start" 0)"
+last_exit="$(read_state "$STATE_DIR/last_exit" 0)"
 [ "$(cat "$STATE_DIR/mode" 2>/dev/null)" = "safe" ] && mode=safe
 if [ "${1:-}" = "--force-safe" ]; then
   mode=safe
   log "started with --force-safe"
 fi
 
-read -r -a APP_ARGV <<<"$APP_ARGS"
+managers="$(manager_sessions 2>/dev/null || true)"
+if [ -n "$managers" ] && [ "$managers" -gt 1 ] 2>/dev/null; then
+  env_note="duplicate systemd user managers: $managers manager session(s) for uid $(id -u). Each one starts $UNIT_NAME, so they race for the same profile and port; the supervisor lock and the peer-port guard keep that from escalating to safe mode, but the duplicate manager itself is an environment problem worth fixing."
+  log "WARNING: $managers systemd user managers for uid $(id -u); $UNIT_NAME is started once per manager"
+  warned="$STATE_DIR/duplicate-managers.warned"
+  if [ ! -f "$warned" ] || [ $(( $(now) - $(read_state "$warned" 0) )) -gt "$FAIL_WINDOW" ]; then
+    write_state "$warned" "$(now)"
+    notify normal "检测到 $managers 个 systemd 用户管理器（同一账号），它们会各启动一份 $UNIT_NAME；看护锁与端口同伴识别已生效，不会因此误入安全模式。"
+  fi
+fi
 
-log "supervisor started (pid $$, profile=$PROFILE, mode=$mode, failures=$failures, threshold=$FAIL_THRESHOLD, window=${FAIL_WINDOW}s, healthy=${HEALTHY_SECONDS}s)"
-trap 'stop=1' TERM INT
+log "supervisor started (pid $$, profile=$PROFILE, mode=$mode, failures=$failures, threshold=$FAIL_THRESHOLD, window=${FAIL_WINDOW}s, healthy=${HEALTHY_SECONDS}s, lock=$LOCK_FILE)"
 
 while :; do
   if [ "$stop" = "1" ]; then
@@ -293,6 +453,18 @@ while :; do
     continue
   fi
 
+  # A port already owned by another DSH of ours means the service is UP, not
+  # that this profile is broken: report it once and wait instead of escalating.
+  if [ "$PORT_GUARD" = "1" ]; then
+    gate_port="$PORT"
+    [ "$mode" = "safe" ] && gate_port="$SAFE_PORT"
+    if [ "${gate_port:-0}" -gt 0 ] 2>/dev/null && peer_owns_port "$gate_port"; then
+      report_peer_port "$gate_port"
+      interruptible_sleep "$STANDBY_POLL"
+      continue
+    fi
+  fi
+
   if [ "$mode" = "normal" ] && [ "$SKIP_PREFLIGHT" != "1" ]; then
     preflight || true
   fi
@@ -301,7 +473,7 @@ while :; do
   use_safe="$mode"
   if [ "$mode" = "safe" ]; then
     if ensure_safe_profile; then
-      start_cmd=("$NODE_BIN" "$DSH_CLI" "$SAFE_PROFILE" "${APP_ARGV[@]}")
+      start_cmd=("$NODE_BIN" "$DSH_CLI" "$SAFE_PROFILE" "${SAFE_APP_ARGV[@]}")
       log "safe mode: booting profile '$SAFE_PROFILE'"
     else
       start_cmd=("$NODE_BIN" "$DSH_CLI" "$PROFILE" "${APP_ARGV[@]}")
@@ -346,6 +518,16 @@ while :; do
   last_exit="$code"
   write_state "$STATE_DIR/last_exit" "$last_exit"
   log "dsh exited code=$last_exit after ${uptime}s (mode=$use_safe)"
+
+  # Never blame the profile for losing a port race: when a peer of ours owns the
+  # port, this is an environment conflict — report it and wait it out.
+  conflict_port="$PORT"
+  [ "$use_safe" != "normal" ] && conflict_port="$SAFE_PORT"
+  if [ "$uptime" -lt "$HEALTHY_SECONDS" ] && last_attempt_port_conflict "$conflict_port"; then
+    report_peer_port "$conflict_port"
+    interruptible_sleep "$STANDBY_POLL"
+    continue
+  fi
 
   if [ "$uptime" -ge "$HEALTHY_SECONDS" ]; then
     # One healthy run clears the ladder.

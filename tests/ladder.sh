@@ -10,7 +10,14 @@
 #   2. healthy run       -> failure ladder reset
 #   3. clean exit        -> supervisor stops (no restart storm)
 #   4. broken config     -> quarantine + restore from the known-good snapshot
+#   …  13-15. the 2026-10-15 guards: a port owned by a peer instance is waited
+#            out, a second supervisor stands by on the lock, and losing the port
+#            race never counts as a profile failure (never a false safe mode)
 set -uo pipefail
+
+# The port guards are exercised explicitly in section 13+; every earlier section
+# only ever runs stub children on port 3999, which is never really bound.
+export DSH_IAN_DAEMON_PORT_GUARD=0
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH="$PLUGIN_DIR/.selftest"
@@ -25,6 +32,10 @@ render() {
       -e "s|@@SAFE_PROFILE@@|dsh-safe|g" \
       -e "s|@@SAFE_TEMPLATE@@|web|g" \
       -e "s|@@APP_ARGS@@|--no-open --port 3999|g" \
+      -e "s|@@SAFE_APP_ARGS@@|--no-open --port 4000|g" \
+      -e "s|@@PORT@@|3999|g" \
+      -e "s|@@SAFE_PORT@@|4000|g" \
+      -e "s|@@PORT_GUARD@@|1|g" \
       -e "s|@@UNIT_NAME@@|dsh-ian-daemon.service|g" \
       -e "s|@@FAIL_WINDOW@@|600|g" \
       -e "s|@@FAIL_THRESHOLD@@|3|g" \
@@ -199,6 +210,80 @@ if command -v node >/dev/null 2>&1; then
   else
     check "restart flow test" "passed" "failed (see $SCRATCH/restart-flow.log)"
   fi
+else
+  echo "  skip (node not on PATH)"
+fi
+
+echo "13. a port owned by a peer instance is waited out, never escalated"
+if command -v node >/dev/null 2>&1; then
+  prepare
+  node -e 'require("net").createServer().listen(3999,"127.0.0.1")' &
+  LISTENER=$!
+  mkdir -p "$SCRATCH/peer"
+  printf '#!/bin/bash\nsleep 60\n' >"$SCRATCH/peer/bin.js"
+  bash "$SCRATCH/peer/bin.js" --port 3999 &
+  PEER=$!
+  await 'ss -ltnH "sport = :3999" 2>/dev/null | grep -q .' 5
+  DSH_IAN_DAEMON_PORT_GUARD=1 DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+    DSH_IAN_DAEMON_STANDBY_POLL=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+  SUP=$!
+  await 'grep -q "peer instance owns port" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
+  kill -TERM "$SUP" 2>/dev/null; wait "$SUP" 2>/dev/null
+  kill -TERM "$LISTENER" "$PEER" 2>/dev/null; wait "$LISTENER" "$PEER" 2>/dev/null
+  check "waited for the peer" "yes" \
+    "$(grep -q 'peer instance owns port 3999' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+  check "no safe mode was entered" "normal" "$(cat "$SCRATCH/home/state/mode" 2>/dev/null || echo normal)"
+  check "no failure was counted" "0" "$(cat "$SCRATCH/home/state/failures" 2>/dev/null || echo 0)"
+  check "incident kind" "peer-port" \
+    "$(grep -o '"kind":"[a-z-]*"' "$SCRATCH/home/state/incident.json" 2>/dev/null | cut -d'"' -f4)"
+  LAUNCHED="$(grep -c 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null | head -1)"
+  check "nothing was launched" "0" "${LAUNCHED:-0}"
+else
+  echo "  skip (node not on PATH)"
+fi
+
+echo "14. a second supervisor on the same profile+port stands by on the lock"
+prepare
+DSH_IAN_DAEMON_EXEC="sleep 30" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+  bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+SUP1=$!
+await 'grep -q "supervisor started" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
+DSH_IAN_DAEMON_EXEC="sleep 30" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 \
+  DSH_IAN_DAEMON_STANDBY_POLL=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+SUP2=$!
+await 'grep -q "standby: another supervisor" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
+STARTS="$(grep -c 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null | head -1)"
+kill -TERM "$SUP2" 2>/dev/null
+kill -TERM "$SUP1" 2>/dev/null
+wait "$SUP2" 2>/dev/null
+wait "$SUP1" 2>/dev/null
+check "the second supervisor stood by" "yes" \
+  "$(grep -q 'standby: another supervisor' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+check "only the lock holder launched a child" "1" "${STARTS:-0}"
+
+echo "15. losing the port race to a peer is not a profile failure"
+if command -v node >/dev/null 2>&1; then
+  prepare
+  printf '#!/bin/bash\necho "listen EADDRINUSE: address already in use 127.0.0.1:3999" >&2\nexit 1\n' >"$SCRATCH/eaddrinuse.sh"
+  chmod +x "$SCRATCH/eaddrinuse.sh"
+  node -e 'require("net").createServer().listen(3999,"127.0.0.1")' &
+  LISTENER=$!
+  mkdir -p "$SCRATCH/peer"
+  printf '#!/bin/bash\nsleep 60\n' >"$SCRATCH/peer/bin.js"
+  bash "$SCRATCH/peer/bin.js" --port 3999 &
+  PEER=$!
+  await 'ss -ltnH "sport = :3999" 2>/dev/null | grep -q .' 5
+  DSH_IAN_DAEMON_EXEC="$SCRATCH/eaddrinuse.sh" DSH_IAN_DAEMON_HEALTHY_SECONDS=5 \
+    DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 DSH_IAN_DAEMON_SKIP_SAFE_PROFILE=1 DSH_IAN_DAEMON_STANDBY_POLL=1 \
+    bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+  SUP=$!
+  await 'grep -q "not counted as a profile failure" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 20
+  kill -TERM "$SUP" 2>/dev/null; wait "$SUP" 2>/dev/null
+  kill -TERM "$LISTENER" "$PEER" 2>/dev/null; wait "$LISTENER" "$PEER" 2>/dev/null
+  check "the port race was not counted" "yes" \
+    "$(grep -q 'not counted as a profile failure' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+  check "still in normal mode" "normal" "$(cat "$SCRATCH/home/state/mode" 2>/dev/null || echo normal)"
+  check "failure counter untouched" "0" "$(cat "$SCRATCH/home/state/failures" 2>/dev/null || echo 0)"
 else
   echo "  skip (node not on PATH)"
 fi

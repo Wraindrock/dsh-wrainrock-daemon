@@ -5,7 +5,7 @@
 | 需求 | 实现 |
 | --- | --- |
 | 1. systemd 开机自启动 | `dsh-ian-daemon.service`（用户级 unit，无需 root）+ `loginctl enable-linger` 使其在开机（而非登录）时启动 |
-| 2. 崩溃 / 损坏自恢复，多次失败进安全模式并汇报 | 看护脚本 `supervisor.sh`：启动前校验配置（损坏则从最近一次正常快照恢复）→ 运行 `dsh` → 统计滚动窗口内的快速失败次数 → 达阈值切换干净的安全 profile `dsh-safe`，写事故报告并弹桌面通知；systemd 的 `OnFailure=` 作为第二道防线 |
+| 2. 崩溃 / 损坏自恢复，多次失败进安全模式并汇报 | 看护脚本 `supervisor.sh`：启动前校验配置（损坏则从最近一次正常快照恢复）→ 运行 `dsh` → 统计滚动窗口内的快速失败次数 → 达阈值切换干净的安全 profile `dsh-safe`，写事故报告并弹桌面通知；systemd 的 `OnFailure=` 作为第二道防线。另有两道**环境守卫**：profile+端口级看护锁（同一个 unit 被两个 systemd 用户管理器各拉起一次时，第二个待命而不是再抢端口）、以及「端口已被同类实例占用」识别（记 `peer-port` 报告并等待，**绝不**升级安全模式）；安全模式另用独立端口启动，保证它一定起得来 |
 | 3. 手动“重启”按钮 | Client 半边在输入框下方的 composer dock 中渲染 **重启** 按钮（点两次确认），调用 Host 的 HTTP 接口完成重启 |
 
 ## 项目改名
@@ -82,6 +82,7 @@
 ~/.dsh/ian-daemon/bin/supervisor.sh                    # 看护脚本（由插件生成，勿手改）
 ~/.dsh/ian-daemon/bin/relaunch.sh                      # 手动实例的接管助手
 ~/.dsh/ian-daemon/state/                               # mode / failures / last_exit / incident.json
+~/.dsh/ian-daemon/state/supervisor-<profile>-<port>.lock   # 看护单例锁（flock，进程退出即释放）
 ~/.dsh/ian-daemon/backup/                              # 最近一次能正常组合的 profile 配置快照
 ~/.dsh/ian-daemon/reports/                             # 事故报告（incident-*.md、latest.md、broken-*/）
 ~/.dsh/ian-daemon/logs/                                # supervisor.log 与 dsh.out.log
@@ -98,7 +99,8 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/ian-daemon/logs/dsh.out.lo
 
 1. **启动前校验**：`dsh --profile web --dump-config`。失败 → 把坏配置留档到 `reports/broken-*`，用 `backup/` 里的快照恢复并继续启动；恢复后仍不行 → 直接进安全模式。
 2. **快速失败计数**：每次运行存活不足 `healthySeconds`(120s) 记 1 次失败；滚动窗口 `failureWindowSeconds`(600s) 内累计到 `failureThreshold`(3) → 进入安全模式。
-3. **安全模式**：首次使用时用官方模板创建 `dsh-safe` profile（只含随 dsh 发布的 bundle），随后一直用它启动；**安全模式是粘性的**，需要显式复位：
+   **例外（环境守卫，2026-10-15 加入）**：若失败原因是端口被**本项目的另一个实例**占用（`EADDRINUSE` 且那个端口确实由同类实例持有），则记 `peer-port` 报告并等待它退出，不计失败、不升级——服务其实已经由同伴提供。
+3. **安全模式**：首次使用时用官方模板创建 `dsh-safe` profile（只含随 dsh 发布的 bundle），随后一直用它启动；**安全模式是粘性的**，需要显式复位。安全模式默认监听 `safePort`（主端口 + 1），这样即使常规 profile 的实例还占着主端口，安全模式也能起来：
 
    ```bash
    curl -X POST -H 'x-dsh-ian-daemon: 1' 'http://127.0.0.1:3080/dsh-ian-daemon/reset?restart=1'
@@ -110,8 +112,10 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/ian-daemon/logs/dsh.out.lo
 ## 配置（profile 的 `cordis.patch.yml` 该行 `config`）
 
 `unitName`、`safeUnitName`、`safeProfile`、`safeTemplate`、`failureThreshold`、`failureWindowSeconds`、
-`healthySeconds`、`maxBackoffSeconds`、`port`、`host`、`extraAppArgs`、`cliPath`、`nodeBin`、
+`healthySeconds`、`maxBackoffSeconds`、`port`、`safePort`、`portGuard`、`host`、`extraAppArgs`、`cliPath`、`nodeBin`、
 `homeDir`、`unitDir`、`installOnActivate`、`startAtBoot`、`enableLinger`、`notify`。
+
+`safePort` 默认是主端口 + 1（安全模式专用）；`portGuard`（默认 `true`）控制「同伴端口识别 + 等待而不升级」这套守卫。
 
 插件没有声明 Config schema（因此插件管理页不显示配置表单），改动请直接编辑补丁行；每次插件激活都会按当前配置重写脚本与 unit。
 
@@ -136,6 +140,20 @@ bash tests/ladder.sh
 不触碰真实 profile 与真实 unit。
 
 ## 修复记录
+
+**2026-10-15 — 「疑似进了安全模式，但不是本项目进的」**。现场：`~/.dsh/ian-daemon/state/mode` 为 `safe`、事故类型是 `safe-mode`，而 `preflight` 一直 ok、`preflight.err` 为空——也就是说 `web` profile 本身没坏。子进程的真实退出原因是
+`listen EADDRINUSE: address already in use 127.0.0.1:3080`。
+
+根因不在 profile，而在环境：这台机器上同一个账号同时存在**两个 systemd 用户管理器**——
+`user@1000.service`（slice `user-1000.slice`，logind 记录的正主、`Linger=yes`）和 `user@ian.service`（slice `user-ian.slice`，登录 / `su -m` 那条路拉起来的）。`dsh-ian-daemon.service` 是 enabled 的，于是**两个管理器各启动了一份**：两个 `supervisor.sh`、两个 `dsh web --port 3080`。先抢到端口的活着，另一份 2 秒内以 1 退出；看护脚本把它读成「profile web 起不来」，3 次快速失败后升级到粘性安全模式。更糟的是旧版安全模式沿用同一个 `--port 3080`，两份实例于是继续为一个端口互抢：赢的那份常驻 `dsh-safe`，输的那份每 120s 空转一次，`mode`/`failures` 还被两份看护互相覆盖，永久卡死。这也解释了为什么插件自己的「复位并重启」按钮救不回来——它所在的进程走 `user@ian.service` 的 bus，`systemctl --user restart` 重启的是**输的那一份** unit，占着端口的那份不会被停掉。
+
+现在三层都堵上了（`tests/ladder.sh` 第 13–15 组断言锁住）：
+
+1. **看护单例锁**：`state/supervisor-<profile>-<port>.lock`（`flock`，进程退出自动释放）。同一 profile+端口只允许一个看护脚本运行；第二个进待命循环，持有者退出后接管。它不会启动第二个 dsh，也不会把同伴的端口算成自己的失败。
+2. **同伴端口识别**：启动前若端口已被同类实例持有（`/proc/*/cmdline` 里带该端口的 dsh 进程，或对端能应答本插件的 `/dsh-ian-daemon/status`），就写一条 `peer-port` 报告并等待，**不计失败、不升级**；端口竞争的失败在子进程退出后也会被同样归类。
+3. **安全模式独立端口**：安全模式默认监听 `safePort`（主端口 + 1），不会再和常规 profile 抢同一个端口；`safePort`、`portGuard` 可配置。
+
+另外插件现在会**检测重复的用户管理器**：`/status.managers`、安装结果 `warnings`、看护启动日志与事故报告的 `## Environment` 小节都会指出「N 个 systemd 用户管理器」并给出建议。守卫能让这个故障不再发生，但重复的管理器本身是环境问题，值得单独清掉（`loginctl list-sessions --class=manager` 看有哪几个，多出来的那个通常来自多余的登录方式或 linger 配置）。
 
 **2026-10-05 — "点重启后关掉但没起来"**。根因有两层：
 
@@ -198,6 +216,6 @@ MIT © 2026 Grant-Felix — 见 [LICENSE](LICENSE)。
 ## 已知边界
 
 - 服务绑定默认回环地址；`dsh web` 的 GUI 需要带 token 的 URL，见上文日志取法。
-- 服务在开机时若端口被别的实例占用，会按快速失败计数升级——这是设计行为。
+- 服务在开机时若端口被**非本项目的**进程占用，仍会按快速失败计数升级到安全模式（此时安全模式用 `safePort` 启动，依然可用）；若占用者是**本项目的另一个实例**，则认定成同伴、等待它退出，绝不会因此升级。
 - 只接管自己写过的 unit：若 `~/.config/systemd/user/dsh-ian-daemon.service` 已存在且不含本插件标记，会先备份为 `*.pre-dsh-ian-daemon` 再覆盖。
 - `package.json` 里的 `private: true` 只用于避免误发到 npm registry；从 GitHub 安装不受影响，要发布到 npm 时删掉它即可。

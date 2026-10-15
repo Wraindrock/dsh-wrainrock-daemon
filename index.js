@@ -263,6 +263,11 @@ export function createManager(ctx, rawConfig) {
     safeTemplate: asString(config.safeTemplate, process.env.DSH_PROFILE || 'web'),
     unitDir: expandHome(asString(config.unitDir, join(home, '.config', 'systemd', 'user')), home),
     port: asNumber(config.port, 0),
+    // Safe mode listens on its own port by default (port+1 when the main port is
+    // known): the old layout reused the main port, so a safe boot could not come
+    // up while a peer still held it — the dead-lock behind the 2026-10-15 incident.
+    safePort: asNumber(config.safePort, 0),
+    portGuard: asBoolean(config.portGuard, true),
     host: asString(config.host, ''),
     extraAppArgs: Array.isArray(config.extraAppArgs) ? config.extraAppArgs.map(String) : [],
     failureWindowSeconds: asNumber(config.failureWindowSeconds, 600),
@@ -336,14 +341,31 @@ export function createManager(ctx, rawConfig) {
     return resolveDshCli(process.argv, settings.cliPath)
   }
 
-  function appArgs() {
-    const args = ['--no-open']
+  /** The port this instance actually serves; 0 means "let dsh pick one". */
+  function resolvedPort() {
     const port = livePort || settings.port
+    return Number.isFinite(port) && port > 0 ? port : 0
+  }
+
+  /** Safe mode must be able to start even while a peer still holds the main port. */
+  function resolvedSafePort() {
+    const configured = Number.isFinite(settings.safePort) && settings.safePort > 0 ? settings.safePort : 0
+    if (configured > 0) return configured
+    const port = resolvedPort()
+    return port > 0 ? port + 1 : 0
+  }
+
+  function appArgsFor(port) {
+    const args = ['--no-open']
     if (port > 0) args.push('--port', String(port))
     if (settings.host !== '') args.push('--host', settings.host)
     args.push(...settings.extraAppArgs)
     return args
   }
+
+  function appArgs() { return appArgsFor(resolvedPort()) }
+
+  function safeAppArgs() { return appArgsFor(resolvedSafePort()) }
 
   function nodeBin() {
     if (existsSync(settings.nodeBin)) return settings.nodeBin
@@ -371,6 +393,10 @@ export function createManager(ctx, rawConfig) {
       SAFE_PROFILE: settings.safeProfile,
       SAFE_TEMPLATE: settings.safeTemplate,
       APP_ARGS: appArgs().join(' '),
+      SAFE_APP_ARGS: safeAppArgs().join(' '),
+      PORT: resolvedPort(),
+      SAFE_PORT: resolvedSafePort(),
+      PORT_GUARD: settings.portGuard ? 1 : 0,
       UNIT_NAME: settings.unitName,
       SAFE_UNIT: settings.safeUnitName,
       MAIN_UNIT: settings.unitName,
@@ -485,6 +511,35 @@ export function createManager(ctx, rawConfig) {
       ok: after === true,
       changed: after === true,
       error: result.code === 0 ? undefined : (result.stderr || result.stdout).trim(),
+    }
+  }
+
+  /**
+   * systemd starts a `user@.service` instance per login — and a lingering user
+   * can get one as well, so some machines end up with both a UID instance
+   * (`user@1000.service`) and a name instance (`user@ian.service`) at once.
+   * Every manager starts this unit, so N managers means N supervisors racing for
+   * one port. Detecting that turns an invisible environment fault into a
+   * reportable one (the supervisor also guards against it at runtime).
+   */
+  async function userManagers() {
+    const result = await run('loginctl', ['list-sessions', '--class=manager', '--no-legend'])
+    if (result.code !== 0) return { known: false, count: 0, ids: [], duplicate: false }
+    const uid = String(typeof process.getuid === 'function' ? process.getuid() : '')
+    const ids = []
+    for (const line of result.stdout.split('\n')) {
+      const fields = line.trim().split(/\s+/)
+      if (fields.length < 4 || fields[0] === '') continue
+      if (fields[1] === uid || fields[2] === userName) ids.push(fields[0])
+    }
+    return {
+      known: true,
+      count: ids.length,
+      ids,
+      duplicate: ids.length > 1,
+      advice: ids.length > 1
+        ? `${ids.length} systemd user managers exist for this account (${ids.join(', ')}). Each one starts ${settings.unitName}, so they race for port ${resolvedPort()}; the supervisor lock and the peer-port guard prevent a false safe mode, but stopping the extra manager is still worth doing.`
+        : undefined,
     }
   }
 
@@ -652,6 +707,10 @@ export function createManager(ctx, rawConfig) {
       result.steps.push({ step: 'start', unit: settings.unitName, ...started })
       if (!started.ok) result.ok = false
     }
+
+    const managers = await userManagers()
+    result.managers = managers
+    if (managers.duplicate) result.warnings.push(managers.advice)
 
     result.paths = { ...paths, unit: unitPath(settings.unitName), safeUnit: unitPath(settings.safeUnitName) }
     result.health = healthStatus()
@@ -1048,6 +1107,7 @@ export function createManager(ctx, rawConfig) {
         safeUnitInstalled: isInstalled(settings.safeUnitName),
       },
       linger,
+      managers: await userManagers(),
       profile: settings.profile,
       safeProfile: settings.safeProfile,
       appArgs: appArgs(),
@@ -1066,6 +1126,9 @@ export function createManager(ctx, rawConfig) {
         healthySeconds: settings.healthySeconds,
         installOnActivate: settings.installOnActivate,
         startAtBoot: settings.startAtBoot,
+        port: resolvedPort(),
+        safePort: resolvedSafePort(),
+        portGuard: settings.portGuard,
       },
     }
   }
@@ -1263,6 +1326,7 @@ export function createManager(ctx, rawConfig) {
       return
     }
     const result = await install({ start: false })
+    if (result.managers?.duplicate) warn(`autostart: ${result.managers.advice}`)
     if (result.ok) {
       info(`autostart ready: unit=${settings.unitName} enabled=${result.enabled === true} linger=${result.linger ?? 'unchanged'} changed=[${(result.changed ?? []).join(', ')}]`)
     } else {
