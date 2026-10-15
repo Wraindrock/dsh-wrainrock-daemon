@@ -288,6 +288,25 @@ else
   echo "  skip (node not on PATH)"
 fi
 
+echo "16. safe mode boots on its own port, never on the profile's port"
+prepare
+printf 'safe\n' >"$SCRATCH/home/state/mode"
+mkdir -p "$SCRATCH/dshhome/profiles/dsh-safe"
+printf '{}' >"$SCRATCH/dshhome/profiles/dsh-safe/package.json"
+DSH_IAN_DAEMON_EXEC="sleep 30" DSH_IAN_DAEMON_SKIP_PREFLIGHT=1 \
+  bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+SUP=$!
+await 'grep -q "start mode=safe" "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null' 15
+kill -TERM "$SUP" 2>/dev/null
+wait "$SUP" 2>/dev/null
+SAFE_LINE="$(grep 'start mode=safe' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null | head -1)"
+check "safe mode used profile dsh-safe" "yes" \
+  "$(printf '%s' "$SAFE_LINE" | grep -q 'dsh-safe' && echo yes || echo no)"
+check "safe mode used the dedicated safe port" "yes" \
+  "$(printf '%s' "$SAFE_LINE" | grep -q -- '--port 4000' && echo yes || echo no)"
+check "safe mode did not reuse the main port" "yes" \
+  "$(printf '%s' "$SAFE_LINE" | grep -q -- '--port 3999' && echo no || echo yes)"
+
 if [ "$FAILED" = "0" ]; then
   echo "all supervisor ladder tests passed"
   rm -rf "$SCRATCH"
