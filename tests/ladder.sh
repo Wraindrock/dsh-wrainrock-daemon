@@ -13,6 +13,9 @@
 #   …  13-15. the 2026-10-15 guards: a port owned by a peer instance is waited
 #            out, a second supervisor stands by on the lock, and losing the port
 #            race never counts as a profile failure (never a false safe mode)
+#   17-18.  the 2026-10-17 fix: stopping one supervisor also stops the peer from
+#            the other systemd user manager, and the systemd-kill helper stops
+#            every supervisor and starts the unit again (restart really restarts)
 set -uo pipefail
 
 # The port guards are exercised explicitly in section 13+; every earlier section
@@ -61,6 +64,18 @@ await() { # shell-condition seconds
   while [ "$(date +%s)" -lt "$deadline" ]; do
     eval "$1" && return 0
     sleep 0.25
+  done
+  return 1
+}
+
+# Wait until a pid is really gone. A zombie still answers kill -0, so look at
+# /proc/PID/stat state instead (a child of this script becomes a zombie first).
+await_exit() { # pid seconds
+  local pid="$1" deadline=$(( $(date +%s) + $2 )) st
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    st="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" || st=''
+    case "$st" in ''|Z) return 0 ;; esac
+    sleep 0.2
   done
   return 1
 }
@@ -306,6 +321,55 @@ check "safe mode used the dedicated safe port" "yes" \
   "$(printf '%s' "$SAFE_LINE" | grep -q -- '--port 4000' && echo yes || echo no)"
 check "safe mode did not reuse the main port" "yes" \
   "$(printf '%s' "$SAFE_LINE" | grep -q -- '--port 3999' && echo no || echo yes)"
+
+echo "17. stopping one supervisor also stops the peer from the other user manager"
+prepare
+DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
+  bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+SUP1=$!
+await 'grep -q "supervisor started" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
+DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
+  DSH_WRAINROCK_DAEMON_STANDBY_POLL=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+SUP2=$!
+await 'grep -q "standby: another supervisor" "$SCRATCH/home/logs/supervisor.log" 2>/dev/null' 15
+# `systemctl --user stop` only reaches the manager that owns the bus, i.e. the
+# standby instance here; the serving peer has to go down by itself.
+kill -TERM "$SUP2" 2>/dev/null
+await_exit "$SUP1" 10
+check "the serving peer stopped as well" "yes" "$(await_exit "$SUP1" 1 && echo yes || echo no)"
+check "the peer stop was logged" "yes" \
+  "$(grep -q 'other supervisor(s) of this install to exit' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+kill -TERM "$SUP1" "$SUP2" 2>/dev/null
+wait "$SUP1" 2>/dev/null; wait "$SUP2" 2>/dev/null
+
+echo "18. the systemd-kill helper stops every supervisor and starts the unit again"
+prepare
+mkdir -p "$SCRATCH/fakebin" "$SCRATCH/fake-sup"
+printf '#!/bin/bash\ntrap "kill $! 2>/dev/null; exit 0" TERM INT\nsleep 300 &\nwait\n' >"$SCRATCH/fake-sup/supervisor.sh"
+chmod +x "$SCRATCH/fake-sup/supervisor.sh"
+bash "$SCRATCH/fake-sup/supervisor.sh" >/dev/null 2>&1 &
+FAKE1=$!
+bash "$SCRATCH/fake-sup/supervisor.sh" >/dev/null 2>&1 &
+FAKE2=$!
+cat >"$SCRATCH/fakebin/systemctl" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >>"$SCRATCH/systemctl.log"
+case "\$*" in
+  *show*) printf '{ path=/bin/bash ; argv[]=/bin/bash %s ; ignore_errors=no }\n' "$SCRATCH/fake-sup/supervisor.sh" ;;
+esac
+exit 0
+EOF
+chmod +x "$SCRATCH/fakebin/systemctl"
+sleep 0.3
+PATH="$SCRATCH/fakebin:$PATH" DSH_RESTART_PORT=0 \
+  bash "$PLUGIN_DIR/relaunch.sh" "$FAKE1" systemd-kill dsh-wrainrock-daemon.service "$SCRATCH" /bin/true
+check "the helper exited cleanly" "0" "$?"
+check "the unit was started again" "yes" \
+  "$(grep -q -- '--user start dsh-wrainrock-daemon.service' "$SCRATCH/systemctl.log" 2>/dev/null && echo yes || echo no)"
+check "the other supervisor was stopped too" "yes" \
+  "$(await_exit "$FAKE2" 5 && echo yes || echo no)"
+kill -TERM "$FAKE1" "$FAKE2" 2>/dev/null
+wait "$FAKE1" 2>/dev/null; wait "$FAKE2" 2>/dev/null
 
 if [ "$FAILED" = "0" ]; then
   echo "all supervisor ladder tests passed"

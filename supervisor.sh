@@ -395,6 +395,43 @@ ensure_safe_profile() {
   return 1
 }
 
+# --- peer stop ---------------------------------------------------------------
+# An account can end up with two systemd user managers (user@1000.service AND
+# user@ian.service); each one starts this unit, and `systemctl --user` reaches
+# only the manager that owns the session bus. A restart issued through it then
+# stops *that* instance while the other one keeps the port: the panel reports
+# success and nothing restarts. A stop therefore takes every other supervisor of
+# this install with it, so the restart comes back as exactly one fresh instance
+# (and a plain `systemctl stop` really stops the service).
+SELF="${BASH_SOURCE[0]:-$0}"
+
+peer_pids() {
+  local entry pid cmd
+  for entry in /proc/[0-9]*; do
+    pid="${entry#/proc/}"
+    [ "$pid" = "$$" ] && continue
+    [ -r "$entry/cmdline" ] || continue
+    cmd="$(tr '\0' '\n' <"$entry/cmdline" 2>/dev/null | sed -n '2p')" || continue
+    [ "$cmd" = "$SELF" ] && printf '%s\n' "$pid"
+  done
+}
+
+peer_stop() {
+  local pid n=0
+  for pid in $(peer_pids); do
+    kill -TERM "$pid" 2>/dev/null && n=$((n + 1)) || true
+  done
+  if [ "$n" -gt 0 ]; then
+    log "stop: asked $n other supervisor(s) of this install to exit (duplicate user manager)"
+  fi
+  return 0
+}
+
+finish() {
+  peer_stop
+  exit 0
+}
+
 # --- main loop ---------------------------------------------------------------
 uptime=0
 stop=0
@@ -416,7 +453,7 @@ if ! lock_try; then
   done
   if [ "$stop" = "1" ]; then
     log "standby: stop requested; exiting"
-    exit 0
+    finish
   fi
   log "standby: lock acquired; taking over profile '$PROFILE'"
 fi
@@ -446,7 +483,7 @@ log "supervisor started (pid $$, profile=$PROFILE, mode=$mode, failures=$failure
 while :; do
   if [ "$stop" = "1" ]; then
     log "stop requested before start; exiting"
-    exit 0
+    finish
   fi
 
   if [ -z "$EXEC_OVERRIDE" ] && ! resolve_runtime; then
@@ -513,7 +550,7 @@ while :; do
     kill -TERM "$child" 2>/dev/null || true
     wait "$child" 2>/dev/null || true
     log "supervisor stopped by signal; dsh terminated"
-    exit 0
+    finish
   fi
 
   uptime=$(( $(now) - start_ts ))

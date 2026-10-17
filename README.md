@@ -136,13 +136,51 @@ loginctl disable-linger "$USER"      # 若不再需要免登录启动
 bash tests/ladder.sh
 ```
 
-用桩命令在 `.selftest/` 里跑完整阶梯（10 项断言组）：崩溃升级到安全模式、健康运行清零、
+用桩命令在 `.selftest/` 里跑完整阶梯（18 组断言组）：崩溃升级到安全模式、健康运行清零、
 干净退出改为重启而不是停服、坏配置隔离+恢复、接管助手两条分支、
 **瞬时 0 退出算启动失败而不是正常退出**、**命令行为空时报错而不启动**、
-**从已安装布局自动修复 node/dsh 路径**、**收到 stop 信号立刻退出**。
-不触碰真实 profile 与真实 unit。
+**从已安装布局自动修复 node/dsh 路径**、**收到 stop 信号立刻退出**、
+**改名迁移（两代旧名）**、**同伴端口等待 / 锁待命 / 端口竞争不计失败 / 安全模式独立端口**、
+**停掉一个看护会停掉另一个管理器的同伴**、**systemd-kill helper 会停掉所有看护并重新拉起 unit**。
+不触碰真实 profile 与真实 unit。另有 `node tests/restart-plan.mjs`（重启决策）与 `node tests/migration.mjs`（改名迁移）。
 
 ## 修复记录
+
+**2026-10-17 — 「重启又失败了，他一直不重启」**。症状：点「重启」后页面回 `202`、`state/client-events.jsonl` 里
+`restart:plan` / `restart:result` 都写着 `ok`，但服务实际没动——`systemctl --user show -p MainPID` 前后是同一个 pid，
+正在服务的看护进程（`…/wrainrock-daemon/bin/supervisor.sh`）也好端端地活着。
+
+根因是 2026-10-15 那个环境问题的**另一面**：两个 systemd 用户管理器各跑一份 unit，而 `systemctl --user` 只连到
+持有会话总线的那一个（`user@ian.service`）。于是：
+
+1. unit 的 `MainPID` 是**待命实例**的看护（它拿不到单例锁，在 `standby` 里等）；
+2. 真正服务的那份跑在 `user@1000.service` 的 cgroup 里，`systemctl --user restart` 从头到尾没碰它；
+3. 待命实例收到 TERM 后按「干净退出」走，`Restart=on-failure` 不会拉起它，而服务的实例也没被要求重启
+   → 重启变成永久空操作（面板还诚实地报告成功，因为 `systemctl` 确实返回 0）。
+
+现在两条路都堵上（`tests/ladder.sh` 第 17–18 组、`tests/restart-plan.mjs` 锁住）：
+
+1. **看护互相停止**：任一 `supervisor.sh` 收到 `TERM`/`INT` 正常退出时，会 `TERM` 掉同一安装（同一 `$SELF`
+   路径）的其它看护；它们在 unit 里以 0 退出，`Restart=on-failure` 不会重启——于是「停」真的是停，
+   多余实例自然收敛为一份。
+2. **重启决策识别「unit 不在自己名下」**：`/restart` 先读 unit 的 `MainPID` 与当前看护 pid，若二者不同
+   （unit 被另一个用户管理器持有），不再做无用的 `systemctl --user restart`，而是交给 detached helper：
+   结束所有看护 → 等端口释放 → `systemctl --user start` 单元。`MainPID` 与看护 pid 一致时仍走原来的直连
+   `systemctl restart`（单管理器环境的行为完全不变）。
+
+脚本与 unit 的写入改成「临时文件 + rename」原子替换：这个修复必须能在旧看护仍在运行时部署，而 bash 是
+惰性读取脚本的，就地截断会让正在运行的看护执行到半截文件。
+
+逃生口（面板完全无响应时）：
+
+```bash
+pkill -f "$HOME/.dsh/wrainrock-daemon/bin/supervisor.sh"
+systemctl --user start dsh-wrainrock-daemon.service
+systemctl --user show dsh-wrainrock-daemon.service -p MainPID --value   # 应等于活着的看护 pid
+```
+
+**非目标**：本项目不会尝试「修好」重复的用户管理器本身（那要 root 改系统/登录配置），只保证在这种环境里
+停、启、重启都不再是空操作；多余的管理器仍应人工清掉。
 
 **2026-10-15 — 「疑似进了安全模式，但不是本项目进的」**。现场：`~/.dsh/wrainrock-daemon/state/mode` 为 `safe`、事故类型是 `safe-mode`，而 `preflight` 一直 ok、`preflight.err` 为空——也就是说 `web` profile 本身没坏。子进程的真实退出原因是
 `listen EADDRINUSE: address already in use 127.0.0.1:3080`。
@@ -196,8 +234,9 @@ bash tests/ladder.sh
 - 插件行激活、Client slot 注册（`conversation.composer.dock` 与 `sidebar.footer.action` 中 `dsh-wrainrock-daemon`，active）；
 - HTTP 接口：`/status`、`/repair`、`/selftest`（真实启停 systemd 用户 unit）、`/mounted`，写操作鉴权（无头 403、GET 405）；
 - unit 语法 `systemd-analyze --user verify`、`systemctl --user is-enabled` = `enabled`、`loginctl` linger；
-- 看护阶梯 **16 组断言全绿**（`bash tests/ladder.sh`，含「冗余用户管理器时第二个看护待命」「安全模式走独立端口」两组新断言）
-  + 改名迁移测试（`node tests/migration.mjs`，对 `dsh-ian-daemon` 与 `dsh-autostart` 两代旧名各跑一遍）；
+- 看护阶梯 **18 组断言全绿**（`bash tests/ladder.sh`，含「冗余用户管理器时第二个看护待命」「安全模式走独立端口」
+  「停掉一个看护会停掉同伴」「systemd-kill helper 重新拉起 unit」四组新断言）
+  + 重启决策测试（`node tests/restart-plan.mjs`）+ 改名迁移测试（`node tests/migration.mjs`，对 `dsh-ian-daemon` 与 `dsh-autostart` 两代旧名各跑一遍）；
 - 用与 `ExecStart` 完全相同的命令行真实启动过 Harness；
 - **真实重启电脑后自动起来**（开机 15 秒内拉起，无需登录），关机时看护脚本干净退出；
 - 手动「重启」按钮点击后成功由 systemd 接管。
@@ -207,7 +246,7 @@ bash tests/ladder.sh
 ## 安装（从 GitHub）
 
 ```bash
-dsh plugin --profile web add github:Grant-Felix/dsh-wrainrock-daemon
+dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 ```
 
 或在 Harness 的插件管理页里用同一 spec 安装。装好后插件会自动写 unit、enable 并开启 linger；
@@ -220,6 +259,8 @@ MIT © 2026 Grant-Felix — 见 [LICENSE](LICENSE)。
 ## 已知边界
 
 - 服务绑定默认回环地址；`dsh web` 的 GUI 需要带 token 的 URL，见上文日志取法。
+- 同一账号上有多个 systemd 用户管理器时，unit 会被启动多份：看护用单例锁+同伴端口识别把服务收敛成一份，
+  停/启/重启也不会再是空操作（见 2026-10-17 修复记录）；但管理器本身是环境问题，本项目不清、也不该清。
 - 服务在开机时若端口被**非本项目的**进程占用，仍会按快速失败计数升级到安全模式（此时安全模式用 `safePort` 启动，依然可用）；若占用者是**本项目的另一个实例**，则认定成同伴、等待它退出，绝不会因此升级。
 - 只接管自己写过的 unit：若 `~/.config/systemd/user/dsh-wrainrock-daemon.service` 已存在且不含本插件标记，会先备份为 `*.pre-dsh-wrainrock-daemon` 再覆盖。
 - `package.json` 里的 `private: true` 只用于避免误发到 npm registry；从 GitHub 安装不受影响，要发布到 npm 时删掉它即可。

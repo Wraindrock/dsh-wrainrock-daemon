@@ -108,9 +108,19 @@ function writeIfChanged(path, content, mode) {
   const current = readText(path)
   if (current === content) return false
   mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, content, 'utf8')
+  // Atomic replace. A running supervisor reads this script lazily, so truncating
+  // it in place (say, to deploy a new one while the old one still runs) can make
+  // bash execute a half-written file; a rename swaps the inode instead.
+  const tmp = `${path}.tmp-${process.pid}`
+  writeFileSync(tmp, content, 'utf8')
   if (mode !== undefined) {
-    try { chmodSync(path, mode) } catch { /* best effort on odd filesystems */ }
+    try { chmodSync(tmp, mode) } catch { /* best effort on odd filesystems */ }
+  }
+  try {
+    renameSync(tmp, path)
+  } catch (error) {
+    try { rmSync(tmp, { force: true }) } catch { /* nothing else to clean up */ }
+    throw error
   }
   return true
 }
@@ -187,6 +197,36 @@ export function resolveDshCli(argv, explicitPath = '') {
     if (/(^|[/\\])(dsh|dsh\.js)$/.test(candidate) && existsSync(candidate)) return candidate
   }
   return typeof explicitPath === 'string' ? explicitPath : ''
+}
+
+/**
+ * Pure policy for the "重启" action, exported so the tests can drive the exact
+ * decision that used to fail silently.
+ *
+ * `systemctl --user` talks to exactly one systemd user manager. When an account
+ * has two of them (user@1000.service and user@ian.service both start the unit),
+ * the unit's MainPID belongs to the *other* manager: a plain restart restarts
+ * the idle standby instance, the serving process keeps the port, and the panel
+ * reports "ok" while nothing restarts. In that case the helper has to stop the
+ * supervisors itself and start the unit again.
+ *
+ * @param {{managed:boolean, enabled:boolean, unitMainPid:number, supervisorPid:number}} input
+ * @returns {{action:'systemd'|'systemd-kill'|'systemd-handoff'|'relaunch', reason?:string}}
+ */
+export function decideRestartPlan({ managed, enabled, unitMainPid, supervisorPid }) {
+  const main = Number(unitMainPid)
+  const sup = Number(supervisorPid)
+  if (managed) {
+    if (Number.isFinite(main) && main > 0 && Number.isFinite(sup) && sup > 0 && main !== sup) {
+      return {
+        action: 'systemd-kill',
+        reason: 'the unit runs under another systemd user manager: a plain restart would only restart the idle standby instance',
+      }
+    }
+    return { action: 'systemd' }
+  }
+  if (enabled) return { action: 'systemd-handoff' }
+  return { action: 'relaunch' }
 }
 
 function tailFile(path, lines, maxBytes = 128 * 1024) {
@@ -1003,31 +1043,63 @@ export function createManager(ctx, rawConfig) {
     return cli === '' ? [] : [cli, settings.profile, ...appArgs()]
   }
 
-  function spawnRelaunch({ useSystemd }) {
+  /** MainPID of the unit instance `systemctl --user` talks to (0 when unknown). */
+  async function unitMainPid() {
+    const res = await systemctl(['show', settings.unitName, '-p', 'MainPID', '--value'])
+    if (res === null || res.code !== 0) return 0
+    const pid = Number(String(res.stdout).trim())
+    return Number.isInteger(pid) && pid > 0 ? pid : 0
+  }
+
+  function spawnRelaunch({ useSystemd, mode = useSystemd ? 'systemd' : 'exec', pid = process.pid }) {
     const command = [nodeBin(), ...capturedArgv()]
     const args = [
       paths.relaunch,
-      String(process.pid),
-      useSystemd ? 'systemd' : 'exec',
+      String(pid),
+      mode,
       settings.unitName,
       process.cwd(),
       ...command,
     ]
-    const child = spawn('/bin/bash', args, { detached: true, stdio: 'ignore', env: process.env })
+    const child = spawn('/bin/bash', args, {
+      detached: true,
+      stdio: 'ignore',
+      // The helper waits for this port to free before it starts the unit again.
+      env: { ...process.env, DSH_RESTART_PORT: String(Number(settings.port) || 0) },
+    })
     child.unref()
-    return { pid: child.pid, useSystemd, command: command.join(' ') }
+    return { pid: child.pid, mode, command: command.join(' ') }
   }
 
   async function planRestart() {
-    if (isManagedByUnit()) {
+    const managed = isManagedByUnit()
+    const decision = decideRestartPlan({
+      managed,
+      enabled: managed ? true : isEnabled(settings.unitName),
+      unitMainPid: managed ? await unitMainPid() : 0,
+      supervisorPid: managed ? process.ppid : 0,
+    })
+    if (decision.action === 'systemd') {
       return { action: 'systemd', unit: settings.unitName, backend: await backend(), message: `restarting ${settings.unitName} through systemd` }
     }
-    const enabled = isEnabled(settings.unitName)
-    const spawned = spawnRelaunch({ useSystemd: enabled })
+    if (decision.action === 'systemd-kill') {
+      // Two user managers each run the unit: `systemctl --user` only sees the
+      // other one, so the helper stops every supervisor and starts the unit.
+      const spawned = spawnRelaunch({ useSystemd: true, mode: 'systemd-kill', pid: process.ppid })
+      return {
+        action: 'systemd-kill',
+        unit: settings.unitName,
+        helperPid: spawned.pid,
+        supervisorPid: process.ppid,
+        reason: decision.reason,
+        message: `两个 systemd 用户管理器各跑一份 ${settings.unitName}：systemctl 只会重启另一份，改由 helper 结束本实例并重新拉起`,
+      }
+    }
+    const spawned = spawnRelaunch({ useSystemd: decision.action === 'systemd-handoff' })
     return {
-      action: enabled ? 'systemd-handoff' : 'relaunch',
+      action: decision.action,
       helperPid: spawned.pid,
-      message: enabled
+      message: decision.action === 'systemd-handoff'
         ? `autostart is enabled: exiting now and letting ${settings.unitName} take over`
         : 'autostart is not enabled: relaunching the same command line detached',
     }
@@ -1035,6 +1107,13 @@ export function createManager(ctx, rawConfig) {
 
   async function performRestart(plan) {
     recordEvent('host', 'restart:perform', { action: plan.action, unit: settings.unitName, managed: isManagedByUnit() })
+    if (plan.action === 'systemd-kill') {
+      // The helper kills this supervisor (and us with it); nothing else to do.
+      const result = { ok: true, via: 'relaunch', action: plan.action }
+      recordEvent('host', 'restart:result', result)
+      info(`handing over to ${paths.relaunch} (${plan.action})`)
+      return result
+    }
     if (plan.action === 'systemd') {
       const result = await (async () => {
         const direct = await systemctl(['restart', settings.unitName])
@@ -1284,7 +1363,13 @@ export function createManager(ctx, rawConfig) {
           if (!mutating(req, res)) return
           try {
             const plan = await planRestart()
-            recordEvent('host', 'restart:plan', { action: plan.action, unit: settings.unitName, managed: isManagedByUnit() })
+            recordEvent('host', 'restart:plan', {
+              action: plan.action,
+              unit: settings.unitName,
+              managed: isManagedByUnit(),
+              supervisorPid: process.ppid,
+              helperPid: plan.helperPid ?? 0,
+            })
             sendJson(res, 202, { ok: true, plan, note: 'the page will answer again once the new process is up' })
             // Long enough for the 202 to reach the browser on loopback, short
             // enough not to be felt: the earlier 700ms was pure added latency.
