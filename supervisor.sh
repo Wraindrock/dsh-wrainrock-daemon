@@ -529,7 +529,15 @@ while :; do
   printf '%s [supervisor] start mode=%s attempt_failures=%s cmd=%s\n' "$(stamp)" "$use_safe" "$failures" "${start_cmd[*]}" >>"$OUT_LOG" 2>/dev/null || true
 
   child=0
-  if [ -n "$EXEC_OVERRIDE" ]; then
+  if [ -n "$EXEC_OVERRIDE" ] && [ -x "$EXEC_OVERRIDE" ]; then
+    # A test hook that names one executable is a path, and a path may contain a
+    # space (this machine's is `/var/home/u/Distrobox/deepseek harness`): running
+    # it unquoted splits the word and the stub never starts. Word-splitting is
+    # kept only for command lines such as `sleep 30`.
+    log "start(test hook): $EXEC_OVERRIDE"
+    "$EXEC_OVERRIDE" >>"$OUT_LOG" 2>&1 &
+    child=$!
+  elif [ -n "$EXEC_OVERRIDE" ]; then
     log "start(test hook): $EXEC_OVERRIDE"
     # shellcheck disable=SC2086
     $EXEC_OVERRIDE >>"$OUT_LOG" 2>&1 &
