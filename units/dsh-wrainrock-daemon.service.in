@@ -11,7 +11,7 @@ OnFailure=@@SAFE_UNIT@@
 
 [Service]
 Type=simple
-ExecStart=/bin/bash @@HOME_DIR@@/bin/supervisor.sh
+ExecStart=@@SUPERVISOR_EXEC@@
 Restart=on-failure
 RestartSec=3
 RestartSteps=5
@@ -22,8 +22,8 @@ Slice=app.slice
 SyslogIdentifier=dsh-wrainrock-daemon
 StandardOutput=journal
 StandardError=journal
-Environment=DSH_HOME=@@DSH_HOME@@
-Environment=PATH=@@PATH@@
+Environment=@@ENV_DSH_HOME@@
+Environment=@@ENV_PATH@@
 
 [Install]
 WantedBy=default.target

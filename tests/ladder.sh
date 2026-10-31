@@ -361,8 +361,12 @@ exit 0
 EOF
 chmod +x "$SCRATCH/fakebin/systemctl"
 sleep 0.3
+# In a real install relaunch.sh sits next to supervisor.sh (both are written into
+# <home>/bin), and that sibling is what the helper trusts — parsing systemd's
+# ExecStart display cannot survive a path containing a space.
+cp "$PLUGIN_DIR/relaunch.sh" "$SCRATCH/fake-sup/relaunch.sh"
 PATH="$SCRATCH/fakebin:$PATH" DSH_RESTART_PORT=0 \
-  bash "$PLUGIN_DIR/relaunch.sh" "$FAKE1" systemd-kill dsh-wrainrock-daemon.service "$SCRATCH" /bin/true
+  bash "$SCRATCH/fake-sup/relaunch.sh" "$FAKE1" systemd-kill dsh-wrainrock-daemon.service "$SCRATCH" /bin/true
 check "the helper exited cleanly" "0" "$?"
 check "the unit was started again" "yes" \
   "$(grep -q -- '--user start dsh-wrainrock-daemon.service' "$SCRATCH/systemctl.log" 2>/dev/null && echo yes || echo no)"
@@ -370,6 +374,30 @@ check "the other supervisor was stopped too" "yes" \
   "$(await_exit "$FAKE2" 5 && echo yes || echo no)"
 kill -TERM "$FAKE1" "$FAKE2" 2>/dev/null
 wait "$FAKE1" 2>/dev/null; wait "$FAKE2" 2>/dev/null
+
+echo "19. a helper without a sibling still finds the supervisor through systemd"
+prepare
+mkdir -p "$SCRATCH/fakebin" "$SCRATCH/lonely" "$SCRATCH/other-sup"
+printf '#!/bin/bash\ntrap "exit 0" TERM INT\nsleep 300 &\nwait\n' >"$SCRATCH/other-sup/supervisor.sh"
+chmod +x "$SCRATCH/other-sup/supervisor.sh"
+bash "$SCRATCH/other-sup/supervisor.sh" >/dev/null 2>&1 &
+FAKE3=$!
+cat >"$SCRATCH/fakebin/systemctl" <<EOF
+#!/bin/bash
+case "\$*" in
+  *show*) printf '{ path=/bin/bash ; argv[]=/bin/bash %s ; ignore_errors=no }\n' "$SCRATCH/other-sup/supervisor.sh" ;;
+esac
+exit 0
+EOF
+chmod +x "$SCRATCH/fakebin/systemctl"
+sleep 0.3
+cp "$PLUGIN_DIR/relaunch.sh" "$SCRATCH/lonely/relaunch.sh"
+PATH="$SCRATCH/fakebin:$PATH" DSH_RESTART_PORT=0 \
+  bash "$SCRATCH/lonely/relaunch.sh" "$FAKE3" systemd-kill dsh-wrainrock-daemon.service "$SCRATCH" /bin/true
+check "the fallback helper exited cleanly" "0" "$?"
+check "the fallback found the supervisor through systemd" "yes" \
+  "$(await_exit "$FAKE3" 5 && echo yes || echo no)"
+kill -TERM "$FAKE3" 2>/dev/null; wait "$FAKE3" 2>/dev/null
 
 if [ "$FAILED" = "0" ]; then
   echo "all supervisor ladder tests passed"

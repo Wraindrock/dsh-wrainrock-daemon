@@ -8,7 +8,7 @@ After=@@MAIN_UNIT@@
 
 [Service]
 Type=simple
-ExecStart=/bin/bash @@HOME_DIR@@/bin/supervisor.sh --force-safe
+ExecStart=@@SAFE_SUPERVISOR_EXEC@@
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30
@@ -17,5 +17,5 @@ Slice=app.slice
 SyslogIdentifier=dsh-wrainrock-daemon-safemode
 StandardOutput=journal
 StandardError=journal
-Environment=DSH_HOME=@@DSH_HOME@@
-Environment=PATH=@@PATH@@
+Environment=@@ENV_DSH_HOME@@
+Environment=@@ENV_PATH@@

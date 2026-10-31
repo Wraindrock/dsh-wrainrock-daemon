@@ -53,10 +53,21 @@ port_free() {
   return 0
 }
 
-# The supervisor script the unit runs, taken from its own ExecStart — no guessing.
+# The supervisor script the unit runs. This helper is installed next to it
+# (bin/relaunch.sh, bin/supervisor.sh), so the sibling path is authoritative —
+# parsing systemd's `ExecStart` display breaks as soon as the path contains a
+# space (`.../deepseek harness/...`), which is exactly the 2026-10-31 incident.
+# The systemd query stays as a fallback for a helper that was copied elsewhere.
 supervisor_script() {
+  local sibling
+  sibling="$(dirname -- "${BASH_SOURCE[0]:-$0}")/supervisor.sh"
+  if [ -f "$sibling" ]; then
+    printf '%s\n' "$sibling"
+    return 0
+  fi
   systemctl --user show "$UNIT" -p ExecStart --value 2>/dev/null \
-    | sed -n 's/.*argv\[\]=\([^;]*\).*/\1/p' | awk '{print $2}'
+    | sed -n 's/.*argv\[\]=\([^;]*\).*/\1/p' \
+    | sed -e 's/^[^ ]* //' -e 's/^"//' -e 's/"$//'
 }
 
 stop_supervisors() { # script

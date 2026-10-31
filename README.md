@@ -239,7 +239,11 @@ systemctl --user show dsh-wrainrock-daemon.service -p MainPID --value   # 应等
   + 重启决策测试（`node tests/restart-plan.mjs`）+ 改名迁移测试（`node tests/migration.mjs`，对 `dsh-ian-daemon` 与 `dsh-autostart` 两代旧名各跑一遍）；
 - 用与 `ExecStart` 完全相同的命令行真实启动过 Harness；
 - **真实重启电脑后自动起来**（开机 15 秒内拉起，无需登录），关机时看护脚本干净退出；
-- 手动「重启」按钮点击后成功由 systemd 接管。
+- 手动「重启」按钮点击后成功由 systemd 接管；
+- **家目录含空格**（`/var/home/u/Distrobox/deepseek harness`，2026-10-31 修复）：
+  unit 的 `ExecStart=`/`Environment=` 现在按 systemd 规则加引号，此前会把监督脚本路径
+  拆成两个词、`/bin/bash /var/.../deepseek` 退出 127，再触发 `StartLimitBurst` 与
+  `OnFailure=` 安全模式循环；`node tests/unit-quoting.mjs` 覆盖这条回归。
 
 未验证：不同发行版/桌面环境下的表现；非 fnm 安装 node 的路径布局。
 

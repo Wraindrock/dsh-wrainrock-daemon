@@ -138,6 +138,41 @@ function render(template, values) {
   })
 }
 
+/**
+ * Quote one word for a systemd unit file.
+ *
+ * systemd splits an unquoted `ExecStart=` / `Environment=` value on whitespace,
+ * so a home directory that contains a space silently becomes two words: the real
+ * 2026-10-31 incident had `$HOME=/var/home/u/Distrobox/deepseek harness`, where
+ * `ExecStart=/bin/bash /var/home/u/Distrobox/deepseek harness/.dsh/...` ran
+ * `/bin/bash /var/home/u/Distrobox/deepseek`, and the unit died with status 127
+ * before the supervisor was ever reached. Double quotes group the word; a
+ * backslash or a double quote inside it has to be escaped.
+ */
+export function unitWord(value) {
+  return `"${String(value).replace(/\\/g, () => '\\\\').replace(/"/g, () => '\\"')}"`
+}
+
+/**
+ * Quote one `ExecStart=` argument. On top of plain word quoting, systemd expands
+ * `%` specifiers and `$VAR` references in every argument after the executable,
+ * so a literal `%` or `$` in a path must be doubled to survive.
+ *
+ * (`Environment=` values are *not* specifier-expanded, so they only need
+ * `unitWord` — doubling a `%` there would store it literally.)
+ */
+export function unitExecArg(value) {
+  return unitWord(String(value).replace(/%/g, () => '%%').replace(/\$/g, () => '$$'))
+}
+
+/** Render the shipped unit templates. Exported so tests can assert the quoting. */
+export function renderUnits(values) {
+  return {
+    main: render(template('units/dsh-wrainrock-daemon.service.in'), values),
+    safe: render(template('units/dsh-wrainrock-daemon-safemode.service.in'), values),
+  }
+}
+
 function template(name) {
   const path = join(PACKAGE_DIR, name)
   const text = readText(path)
@@ -464,7 +499,12 @@ export function createManager(ctx, rawConfig) {
       HEALTHY_SECONDS: settings.healthySeconds,
       MAX_BACKOFF: settings.maxBackoffSeconds,
       NOTIFY: settings.notify ? 1 : 0,
-      PATH: `${dirname(nodeBin())}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+      // Unit files are not shell scripts: every value that may contain a space
+      // has to be quoted here, or systemd splits it into separate words.
+      SUPERVISOR_EXEC: `/bin/bash ${unitExecArg(paths.supervisor)}`,
+      SAFE_SUPERVISOR_EXEC: `/bin/bash ${unitExecArg(paths.supervisor)} --force-safe`,
+      ENV_DSH_HOME: unitWord(`DSH_HOME=${dshHome}`),
+      ENV_PATH: unitWord(`PATH=${dirname(nodeBin())}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`),
     }
   }
 
@@ -632,8 +672,7 @@ export function createManager(ctx, rawConfig) {
   function writeUnits() {
     const values = templateValues()
     const changed = []
-    const main = render(template('units/dsh-wrainrock-daemon.service.in'), values)
-    const safe = render(template('units/dsh-wrainrock-daemon-safemode.service.in'), values)
+    const { main, safe } = renderUnits(values)
     if (writeIfChanged(unitPath(settings.unitName), main, 0o644)) changed.push(settings.unitName)
     if (writeIfChanged(unitPath(settings.safeUnitName), safe, 0o644)) changed.push(settings.safeUnitName)
     return changed
