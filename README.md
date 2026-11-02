@@ -88,7 +88,7 @@
 ~/.dsh/wrainrock-daemon/state/supervisor-<profile>-<port>.lock   # 看护单例锁（flock，进程退出即释放）
 ~/.dsh/wrainrock-daemon/backup/                              # 最近一次能正常组合的 profile 配置快照
 ~/.dsh/wrainrock-daemon/reports/                             # 事故报告（incident-*.md、latest.md、broken-*/）
-~/.dsh/wrainrock-daemon/logs/                                # supervisor.log 与 dsh.out.log
+~/.dsh/wrainrock-daemon/logs/                                # supervisor.log、dsh.out.log、relaunch.log（重启助手）
 ```
 
 开机后 GUI 地址（带 token）写在启动日志里：
@@ -145,6 +145,28 @@ bash tests/ladder.sh
 不触碰真实 profile 与真实 unit。另有 `node tests/restart-plan.mjs`（重启决策）与 `node tests/migration.mjs`（改名迁移）。
 
 ## 修复记录
+
+**2026-11-02 — 「重启之后服务没回来，面板一直显示未运行」**。症状：13:57 点「重启」，页面再没回来；
+`state/client-events.jsonl` 里 `restart:result` 写着 `ok`，unit 却从那一刻起一直是 `inactive`，
+后来那份 `dsh web` 是手动起的，一直跑到晚上。
+
+根因：`systemd-kill` 助手就住在它要拆的 cgroup 里。它由 unit 内的 web 进程 spawn，天然继承
+`dsh-wrainrock-daemon.service` 的 cgroup；它按设计先 `TERM` 看护（unit 的 `MainPID`），systemd 随即按
+`KillMode=control-group` 清空整个 cgroup——助手被一起收走，脚本末尾那句 `systemctl --user start` 根本没跑到。
+看护是干净退出（`code=0`），`Restart=on-failure` 不会拉起，于是 unit 永远停在 inactive。
+
+三处改动：
+
+1. `relaunch.sh` 在 `systemd-kill` 开头把自己 `re-exec` 进 `systemd-run --user --scope` 的新 scope
+   （先用 `/bin/true` 探一次，systemd-run 不可用就原地跑），它要拆的 cgroup 里不再有自己。
+2. 助手把过程写进 `logs/relaunch.log`（不再 `stdio: ignore` 丢掉），`start` 之后轮询 `is-active`
+   两测一秒，unit 没起来就记日志并 `exit 1`——同类问题下次能直接看到原因，而不是只剩一个 `ok`。
+3. 插件激活时自愈：unit 已 enabled 却没在跑（上次重启没回来、或 web 是手动起的），直接 `StartUnit`
+   重新武装；状态是 `failed`（`StartLimitBurst`）时先 `reset-failed`。看护起来后看到端口被本进程占着，
+   只报告 peer 并待命，不会抢端口。
+
+`tests/ladder.sh` 18/19 组加了 `systemd-run` 桩：断言助手先跳出 scope、并且 `start` 后确实做了 `is-active`
+校验；5/6 组断言 `relaunch.log` 落盘。46 个断言全绿。
 
 **2026-10-17 — 「重启又失败了，他一直不重启」**。症状：点「重启」后页面回 `202`、`state/client-events.jsonl` 里
 `restart:plan` / `restart:result` 都写着 `ok`，但服务实际没动——`systemctl --user show -p MainPID` 前后是同一个 pid，

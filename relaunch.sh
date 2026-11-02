@@ -23,6 +23,7 @@ OLD_PID="${1:-0}"
 MODE="${2:-exec}"
 UNIT="${3:-}"
 CWD="${4:-}"
+ORIGINAL_ARGS=("$@")
 shift 4 2>/dev/null || true
 
 PORT="${DSH_RESTART_PORT:-0}"
@@ -32,6 +33,33 @@ export XDG_RUNTIME_DIR="$RUNTIME"
 # environment; the manager socket lives at a fixed place on this host.
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$RUNTIME/bus" ]; then
   export DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME/bus"
+fi
+
+# The page that triggered the restart is gone by the time anything here fails,
+# so the helper explains itself in a log file instead of /dev/null. Without
+# this, a restart that left the service dead was undiagnosable (2026-11-02).
+if [ -n "${DSH_RELAUNCH_LOG:-}" ]; then
+  mkdir -p "$(dirname -- "$DSH_RELAUNCH_LOG")" 2>/dev/null && exec >>"$DSH_RELAUNCH_LOG" 2>&1 || true
+fi
+log() { printf '[relaunch %s] %s\n' "$(date -Is)" "$*"; }
+
+log "start mode=$MODE old_pid=$OLD_PID unit=$UNIT cwd=$CWD pid=$$"
+
+# `systemd-kill` stops the unit this helper runs inside. The helper inherited
+# that unit's cgroup, and systemd reaps the whole cgroup (KillMode=control-group)
+# the instant its main process — the supervisor — dies, so the "start the unit
+# again" step never ran: a restart left the service dead until a hand-started
+# `dsh web` (2026-11-02). Moving into a scope of our own first keeps the helper
+# out of the cgroup it is about to tear down.
+if [ "$MODE" = "systemd-kill" ] && [ "${DSH_RELAUNCH_SCOPED:-}" != "1" ] \
+   && command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user --scope --quiet --collect /bin/true >/dev/null 2>&1; then
+  export DSH_RELAUNCH_SCOPED=1
+  log "re-executing in a transient scope so the unit teardown cannot reap this helper"
+  systemd-run --user --scope --quiet --collect /bin/bash "${BASH_SOURCE[0]:-$0}" "${ORIGINAL_ARGS[@]}"
+  status=$?
+  log "scoped helper exited with $status"
+  exit "$status"
 fi
 
 wait_gone() { # pid seconds
@@ -87,9 +115,31 @@ stop_supervisors() { # script
   return 0
 }
 
+unit_path() {
+  # dsh-wrainrock-daemon.service -> /org/freedesktop/systemd1/unit/dsh_2dwrainrock_2ddaemon_2eservice
+  printf '/org/freedesktop/systemd1/unit/%s' "$(printf '%s' "$UNIT" | sed -e 's/-/_2d/g' -e 's/\./_2e/g')"
+}
+
+unit_is_active() {
+  systemctl --user is-active --quiet "$UNIT" 2>/dev/null && return 0
+  # `systemctl --user` can be unavailable in restricted/namespaced sessions.
+  busctl --user get-property org.freedesktop.systemd1 "$(unit_path)" \
+    org.freedesktop.systemd1.Unit ActiveState 2>/dev/null \
+    | grep -qE '"(active|activating|reloading)"'
+}
+
+start_unit() {
+  systemctl --user start "$UNIT" && return 0
+  systemctl --user restart "$UNIT" && return 0
+  busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager StartUnit ss "$UNIT" replace && return 0
+  return 1
+}
+
 case "$MODE" in
   systemd-kill)
     [ -n "$UNIT" ] || exit 1
+    log "systemd-kill: stopping supervisors, then starting $UNIT again"
     sleep 0.2                      # let the HTTP 202 reach the page first
     stop_supervisors "$(supervisor_script)"
     if [ "${OLD_PID:-0}" -gt 1 ]; then
@@ -98,12 +148,26 @@ case "$MODE" in
     fi
     for _ in $(seq 1 100); do port_free && break; sleep 0.2; done
     systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
-    if systemctl --user start "$UNIT" >/dev/null 2>&1; then exit 0; fi
-    if systemctl --user restart "$UNIT" >/dev/null 2>&1; then exit 0; fi
-    if busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
-      org.freedesktop.systemd1.Manager StartUnit ss "$UNIT" replace >/dev/null 2>&1; then
-      exit 0
+    if ! start_unit; then
+      log "could not start $UNIT: neither systemctl nor the D-Bus manager accepted it"
+      exit 1
     fi
+    # `systemctl start` only reports that the job was queued; the unit can die
+    # again immediately (bad ExecStart, missing script). Say so instead of
+    # claiming a restart that did not happen.
+    for _ in $(seq 1 100); do
+      if unit_is_active; then
+        sleep 1
+        if unit_is_active; then
+          log "$UNIT is active after the restart"
+          exit 0
+        fi
+        log "$UNIT became active and died again"
+        exit 1
+      fi
+      sleep 0.2
+    done
+    log "$UNIT did not become active within 20s of the start job"
     exit 1
     ;;
   systemd)
@@ -114,15 +178,19 @@ case "$MODE" in
       sleep 0.1
     done
     sleep 0.6
+    log "systemd: restarting $UNIT"
     if systemctl --user restart "$UNIT" >/dev/null 2>&1; then
+      log "$UNIT restart job accepted"
       exit 0
     fi
     # `systemctl --user` can be unavailable in restricted/namespaced sessions;
     # fall back to the same D-Bus call systemd exposes.
     if busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
       org.freedesktop.systemd1.Manager RestartUnit ss "$UNIT" replace >/dev/null 2>&1; then
+      log "$UNIT restart job accepted over D-Bus"
       exit 0
     fi
+    log "could not restart $UNIT: neither systemctl nor the D-Bus manager accepted it"
     exit 1
     ;;
 esac

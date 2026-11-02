@@ -143,13 +143,19 @@ check "broken config quarantined" "1" "$(ls -1d "$SCRATCH/home/reports"/broken-*
 echo "5. the relaunch helper waits for the old pid and re-executes"
 prepare
 ( sleep 0.4 ) & old_pid=$!
-bash "$PLUGIN_DIR/relaunch.sh" "$old_pid" exec "" "$SCRATCH" /bin/bash -c "echo relaunched >'$SCRATCH/relaunch-ok'"
+DSH_RELAUNCH_LOG="$SCRATCH/relaunch.log" \
+  bash "$PLUGIN_DIR/relaunch.sh" "$old_pid" exec "" "$SCRATCH" /bin/bash -c "echo relaunched >'$SCRATCH/relaunch-ok'"
 check "helper exit code" "0" "$?"
 check "command was re-executed" "relaunched" "$(cat "$SCRATCH/relaunch-ok" 2>/dev/null)"
+check "helper left a log behind" "yes" \
+  "$(grep -q 'start mode=exec' "$SCRATCH/relaunch.log" 2>/dev/null && echo yes || echo no)"
 
 echo "6. the relaunch helper fails fast when systemd cannot restart the unit"
-bash "$PLUGIN_DIR/relaunch.sh" 1 systemd dsh-wrainrock-daemon-does-not-exist.service "" /bin/true
+DSH_RELAUNCH_LOG="$SCRATCH/relaunch.log" \
+  bash "$PLUGIN_DIR/relaunch.sh" 1 systemd dsh-wrainrock-daemon-does-not-exist.service "" /bin/true
 check "helper exit code" "1" "$?"
+check "helper logged the failure" "yes" \
+  "$(grep -q 'could not restart' "$SCRATCH/relaunch.log" 2>/dev/null && echo yes || echo no)"
 
 echo "7. an instant exit 0 is a failed start, not a clean stop"
 prepare
@@ -360,16 +366,28 @@ esac
 exit 0
 EOF
 chmod +x "$SCRATCH/fakebin/systemctl"
+# The helper re-executes itself inside a transient scope before tearing the unit
+# down; run the command directly here and let it report that it did so.
+cat >"$SCRATCH/fakebin/systemd-run" <<'EOF'
+#!/bin/bash
+while [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do shift; done
+exec "$@"
+EOF
+chmod +x "$SCRATCH/fakebin/systemd-run"
 sleep 0.3
 # In a real install relaunch.sh sits next to supervisor.sh (both are written into
 # <home>/bin), and that sibling is what the helper trusts — parsing systemd's
 # ExecStart display cannot survive a path containing a space.
 cp "$PLUGIN_DIR/relaunch.sh" "$SCRATCH/fake-sup/relaunch.sh"
-PATH="$SCRATCH/fakebin:$PATH" DSH_RESTART_PORT=0 \
+PATH="$SCRATCH/fakebin:$PATH" DSH_RESTART_PORT=0 DSH_RELAUNCH_LOG="$SCRATCH/relaunch.log" \
   bash "$SCRATCH/fake-sup/relaunch.sh" "$FAKE1" systemd-kill dsh-wrainrock-daemon.service "$SCRATCH" /bin/true
 check "the helper exited cleanly" "0" "$?"
+check "the helper escaped the unit cgroup before stopping it" "yes" \
+  "$(grep -q 're-executing in a transient scope' "$SCRATCH/relaunch.log" 2>/dev/null && echo yes || echo no)"
 check "the unit was started again" "yes" \
   "$(grep -q -- '--user start dsh-wrainrock-daemon.service' "$SCRATCH/systemctl.log" 2>/dev/null && echo yes || echo no)"
+check "the unit was verified active" "yes" \
+  "$(grep -q -- '--user is-active' "$SCRATCH/systemctl.log" 2>/dev/null && echo yes || echo no)"
 check "the other supervisor was stopped too" "yes" \
   "$(await_exit "$FAKE2" 5 && echo yes || echo no)"
 kill -TERM "$FAKE1" "$FAKE2" 2>/dev/null
@@ -390,6 +408,8 @@ esac
 exit 0
 EOF
 chmod +x "$SCRATCH/fakebin/systemctl"
+printf '#!/bin/bash\nwhile [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do shift; done\nexec "$@"\n' >"$SCRATCH/fakebin/systemd-run"
+chmod +x "$SCRATCH/fakebin/systemd-run"
 sleep 0.3
 cp "$PLUGIN_DIR/relaunch.sh" "$SCRATCH/lonely/relaunch.sh"
 PATH="$SCRATCH/fakebin:$PATH" DSH_RESTART_PORT=0 \

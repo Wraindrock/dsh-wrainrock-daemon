@@ -1090,6 +1090,13 @@ export function createManager(ctx, rawConfig) {
     return Number.isInteger(pid) && pid > 0 ? pid : 0
   }
 
+  /**
+   * Spawn the relaunch helper. The helper itself moves into a transient scope
+   * when it has to stop the unit (see relaunch.sh): started from inside
+   * `dsh-wrainrock-daemon.service` it inherits that unit's cgroup, and systemd
+   * reaps the cgroup (`KillMode=control-group`) the moment the supervisor dies
+   * — before the helper could start the unit again (2026-11-02 incident).
+   */
   function spawnRelaunch({ useSystemd, mode = useSystemd ? 'systemd' : 'exec', pid = process.pid }) {
     const command = [nodeBin(), ...capturedArgv()]
     const args = [
@@ -1100,12 +1107,15 @@ export function createManager(ctx, rawConfig) {
       process.cwd(),
       ...command,
     ]
-    const child = spawn('/bin/bash', args, {
-      detached: true,
-      stdio: 'ignore',
+    const env = {
+      ...process.env,
       // The helper waits for this port to free before it starts the unit again.
-      env: { ...process.env, DSH_RESTART_PORT: String(Number(settings.port) || 0) },
-    })
+      DSH_RESTART_PORT: String(Number(settings.port) || 0),
+      // The page is gone by the time the helper can fail: keep its output.
+      DSH_RELAUNCH_LOG: join(paths.logDir, 'relaunch.log'),
+    }
+    const child = spawn('/bin/bash', args, { detached: true, stdio: 'ignore', env })
+    child.on('error', () => {})
     child.unref()
     return { pid: child.pid, mode, command: command.join(' ') }
   }
@@ -1493,6 +1503,24 @@ export function createManager(ctx, rawConfig) {
       info(`autostart ready: unit=${settings.unitName} enabled=${result.enabled === true} linger=${result.linger ?? 'unchanged'} changed=[${(result.changed ?? []).join(', ')}]`)
     } else {
       warn(`autostart install incomplete: ${result.error ?? (result.warnings ?? []).join('; ')}`)
+    }
+
+    // An enabled unit that is not running means nothing is supervising this
+    // process: the last restart did not come back, or the web was started by
+    // hand after the unit died. Nothing else would ever re-arm it — the unit
+    // was left "enabled but stopped" for hours on 2026-11-02. Starting it now
+    // is safe: the supervisor sees this process holding the port, reports a
+    // peer, and stands by until this process exits.
+    if (result.ok && result.enabled === true && !isManagedByUnit()) {
+      const state = await activeState(settings.unitName)
+      if (state.state !== 'active' && state.state !== 'activating') {
+        // A unit that hit StartLimitBurst stays refused until the counter is
+        // cleared, and re-arming would look like it worked while nothing ran.
+        if (state.state === 'failed') await systemctl(['reset-failed', settings.unitName])
+        const started = await unitVerb('StartUnit', settings.unitName)
+        if (started.ok) info(`autostart re-armed: ${settings.unitName} was enabled but not running (was ${state.state})`)
+        else warn(`autostart re-arm failed (${started.via}): ${started.error || 'unknown error'}`)
+      }
     }
   }
 
