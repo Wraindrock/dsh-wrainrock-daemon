@@ -553,6 +553,9 @@ export function createManager(ctx, rawConfig) {
       // Empty on a real host; inside distrobox/podman this keeps the host's
       // user manager from starting a second instance of the same unit.
       CONDITION: settings.containerOnly ? 'ConditionVirtualization=container' : '',
+      // `containerKind()` returns 'none' on a real host; the shell-side guard
+      // keys on the empty string, so map host to ''.
+      CONTAINER_KIND: containerKind() === 'none' ? '' : containerKind(),
     }
   }
 

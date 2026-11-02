@@ -61,6 +61,11 @@ FAIL_THRESHOLD="${DSH_WRAINROCK_DAEMON_FAIL_THRESHOLD:-@@FAIL_THRESHOLD@@}"
 HEALTHY_SECONDS="${DSH_WRAINROCK_DAEMON_HEALTHY_SECONDS:-@@HEALTHY_SECONDS@@}"
 MAX_BACKOFF="${DSH_WRAINROCK_DAEMON_MAX_BACKOFF:-@@MAX_BACKOFF@@}"
 NOTIFY="${DSH_WRAINROCK_DAEMON_NOTIFY:-@@NOTIFY@@}"
+# Empty on a real host; `container` (or `podman`) inside distrobox/podman.
+# Two user managers for one uid are the *normal* host+container layout, so the
+# supervisor must not pester the user about it — only the genuine duplicate on a
+# plain host is worth a warning.
+CONTAINER="@@CONTAINER_KIND@@"
 
 # --- test hooks (never set by the unit) --------------------------------------
 EXEC_OVERRIDE="${DSH_WRAINROCK_DAEMON_EXEC:-}"
@@ -468,7 +473,7 @@ if [ "${1:-}" = "--force-safe" ]; then
 fi
 
 managers="$(manager_sessions 2>/dev/null || true)"
-if [ -n "$managers" ] && [ "$managers" -gt 1 ] 2>/dev/null; then
+if [ -n "$managers" ] && [ "$managers" -gt 1 ] 2>/dev/null && [ "$CONTAINER" = "" ]; then
   env_note="duplicate systemd user managers: $managers manager session(s) for uid $(id -u). Each one starts $UNIT_NAME, so they race for the same profile and port; the supervisor lock and the peer-port guard keep that from escalating to safe mode, but the duplicate manager itself is an environment problem worth fixing."
   log "WARNING: $managers systemd user managers for uid $(id -u); $UNIT_NAME is started once per manager"
   warned="$STATE_DIR/duplicate-managers.warned"
@@ -476,6 +481,8 @@ if [ -n "$managers" ] && [ "$managers" -gt 1 ] 2>/dev/null; then
     write_state "$warned" "$(now)"
     notify normal "检测到 $managers 个 systemd 用户管理器（同一账号），它们会各启动一份 $UNIT_NAME；看护锁与端口同伴识别已生效，不会因此误入安全模式。"
   fi
+elif [ -n "$CONTAINER" ]; then
+  log "running inside $CONTAINER: multiple user managers are the normal host+container layout; unit pinned to this side"
 fi
 
 log "supervisor started (pid $$, profile=$PROFILE, mode=$mode, failures=$failures, threshold=$FAIL_THRESHOLD, window=${FAIL_WINDOW}s, healthy=${HEALTHY_SECONDS}s, lock=$LOCK_FILE)"

@@ -45,6 +45,7 @@ render() {
       -e "s|@@HEALTHY_SECONDS@@|1|g" \
       -e "s|@@MAX_BACKOFF@@|2|g" \
       -e "s|@@NOTIFY@@|0|g" \
+      -e "s|@@CONTAINER_KIND@@||g" \
       "$PLUGIN_DIR/supervisor.sh"
 }
 
