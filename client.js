@@ -45,6 +45,11 @@ window.__ModuleLoader__.load({
       hint: '重启 DeepSeek Harness',
       hintSafe: '重启 DeepSeek Harness（上次启动进入了安全模式）',
       unavailable: '无法读取服务状态',
+      // Temporary crash recovery: one plugin is disabled for THIS boot only and
+      // is re-enabled automatically once a run stays healthy.
+      temporaryDisabled: '临时禁用',
+      temporaryDisabledHint: '本次启动临时禁用了 {ids}（崩溃自动恢复）；服务稳定运行后会自动撤销',
+      temporaryDisabledAria: '本次启动临时禁用了 {ids}',
     }
     const en = {
       restart: 'Restart',
@@ -58,6 +63,9 @@ window.__ModuleLoader__.load({
       hint: 'Restart DeepSeek Harness',
       hintSafe: 'Restart DeepSeek Harness (the last boot entered safe mode)',
       unavailable: 'Service status unavailable',
+      temporaryDisabled: 'Temp disabled',
+      temporaryDisabledHint: 'This boot temporarily disabled {ids} (automatic crash recovery); it is re-enabled once the service stays healthy',
+      temporaryDisabledAria: 'This boot temporarily disabled {ids}',
     }
 
     const CSS = `
@@ -84,6 +92,9 @@ window.__ModuleLoader__.load({
 .dsa-row.dsa-rail{border-radius:var(--dsw-radius-md,8px);width:36px;height:36px;justify-content:center;margin:0;padding:0}
 .dsa-row.dsa-warn{color:var(--dsw-alias-state-warn-primary)}
 .dsa-rowLabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.dsa-badge{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 6px;
+  border:1px solid var(--dsw-alias-state-warn-primary);border-radius:999px;
+  color:var(--dsw-alias-state-warn-primary);font-size:10px;line-height:1;white-space:nowrap}
 `
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -302,13 +313,42 @@ window.__ModuleLoader__.load({
       return t('restart')
     }
 
+    /**
+     * Plugin ids the supervisor disabled for THIS boot only (automatic crash
+     * recovery). The Host clears them after a healthy run, so the badge is
+     * expected to disappear on its own — it is a state, not a setting.
+     */
+    function recoveryIds(flow) {
+      const recovery = flow?.lastStatus?.supervisor?.recovery
+      const ids = Array.isArray(recovery?.ids) ? recovery.ids.filter((id) => typeof id === 'string' && id !== '') : []
+      return ids.length > 0 ? ids : []
+    }
+
+    function fillIds(template, ids) {
+      return String(template).replace('{ids}', ids.join(', '))
+    }
+
     function titleOf(flow, t) {
       const safeMode = flow.lastStatus?.supervisor?.mode === 'safe'
       const parts = [safeMode ? t('hintSafe') : t('hint')]
       if (safeMode) parts.push(t('safe'))
+      const ids = recoveryIds(flow)
+      if (ids.length > 0) parts.push(fillIds(t('temporaryDisabledHint'), ids))
       if (flow.note) parts.push(flow.note)
       if (flow.lastStatus === null) parts.push(t('unavailable'))
       return parts.join(' · ')
+    }
+
+    /** Warn-tinted pill next to the control; renders nothing when nothing is disabled. */
+    function RecoveryBadge(props) {
+      const ids = props.ids
+      if (ids.length === 0) return null
+      return h('span', {
+        className: 'dsa-badge',
+        title: fillIds(props.t('temporaryDisabledHint'), ids),
+        'aria-label': fillIds(props.t('temporaryDisabledAria'), ids),
+        'data-dsa-temporary-disabled': ids.join(','),
+      }, props.compact ? props.t('temporaryDisabled') : `${props.t('temporaryDisabled')}: ${ids.join(', ')}`)
     }
 
     /** Compact control for the composer dock (a flex row under the input). */
@@ -316,11 +356,12 @@ window.__ModuleLoader__.load({
       const t = props.t
       const flow = useFlow('dock')
       const safeMode = flow.lastStatus?.supervisor?.mode === 'safe'
-      return h('span', { style: { display: 'inline-flex', alignItems: 'center' } },
+      const ids = recoveryIds(flow)
+      return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '6px' } },
         h('style', null, CSS),
         h('button', {
           type: 'button',
-          className: ['dsa-btn', flow.phase === 'confirm' || flow.phase === 'error' ? 'dsa-danger' : '', safeMode ? 'dsa-warn' : ''].filter(Boolean).join(' '),
+          className: ['dsa-btn', flow.phase === 'confirm' || flow.phase === 'error' ? 'dsa-danger' : '', safeMode || ids.length > 0 ? 'dsa-warn' : ''].filter(Boolean).join(' '),
           title: titleOf(flow, t),
           'aria-label': t('restart'),
           'aria-busy': flow.phase === 'busy',
@@ -330,7 +371,8 @@ window.__ModuleLoader__.load({
         },
         h(RestartIcon, { spinning: flow.phase === 'busy' }),
         h('span', null, labelOf(flow, t)),
-        safeMode ? h('span', { className: 'dsa-dot' }) : null))
+        safeMode ? h('span', { className: 'dsa-dot' }) : null),
+        h(RecoveryBadge, { ids, t, compact: true }))
     }
 
     /** Full row beside Settings in the sidebar foot; icon-only on the collapsed rail. */
@@ -339,11 +381,12 @@ window.__ModuleLoader__.load({
       const wide = props.wide !== false
       const flow = useFlow('sidebar')
       const safeMode = flow.lastStatus?.supervisor?.mode === 'safe'
-      return h('span', { style: { display: 'inline-flex', alignItems: 'center', width: wide ? '100%' : undefined } },
+      const ids = recoveryIds(flow)
+      return h('span', { style: { display: 'inline-flex', alignItems: 'center', width: wide ? '100%' : undefined, gap: '6px' } },
         h('style', null, CSS),
         h('button', {
           type: 'button',
-          className: ['dsa-row', wide ? '' : 'dsa-rail', safeMode ? 'dsa-warn' : ''].filter(Boolean).join(' '),
+          className: ['dsa-row', wide ? '' : 'dsa-rail', safeMode || ids.length > 0 ? 'dsa-warn' : ''].filter(Boolean).join(' '),
           title: titleOf(flow, t),
           'aria-label': t('restart'),
           'aria-busy': flow.phase === 'busy',
@@ -353,7 +396,9 @@ window.__ModuleLoader__.load({
         },
         h(RestartIcon, { spinning: flow.phase === 'busy' }),
         wide ? h('span', { className: 'dsa-rowLabel' }, labelOf(flow, t)) : null,
-        safeMode ? h('span', { className: 'dsa-dot' }) : null))
+        safeMode ? h('span', { className: 'dsa-dot' }) : null),
+        // The rail is 36px wide: no room for a pill without breaking the layout.
+        wide ? h(RecoveryBadge, { ids, t, compact: true }) : null)
     }
 
     /** Plain, dependency-free control: shown if the styled one ever throws. */
@@ -442,7 +487,7 @@ window.__ModuleLoader__.load({
       },
       // Test seam: the restart lifecycle is the part that must not regress and
       // the part a browser cannot be driven into reproducing here.
-      __test: { createRestartFlow, decideAfterPoll },
+      __test: { createRestartFlow, decideAfterPoll, recoveryIds, fillIds },
     }
   },
 })

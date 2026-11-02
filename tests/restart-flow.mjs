@@ -43,7 +43,7 @@ const plugin = registration.factory((spec) => {
 check('registers the documented entry id', '@local/dsh-wrainrock-daemon', registration.id)
 check('exposes the restart test seam', 'function', typeof plugin.__test?.createRestartFlow)
 
-const { createRestartFlow, decideAfterPoll } = plugin.__test
+const { createRestartFlow, decideAfterPoll, recoveryIds, fillIds } = plugin.__test
 
 function harness(options) {
   let clock = 0
@@ -150,6 +150,22 @@ check('unknown before + outage -> reload', 'reload', decideAfterPoll({ before: n
 check('stale but not ready -> keep waiting', 'wait-not-ready', decideAfterPoll({ before: 1, next: { process: { pid: 2 }, ready: false }, sawDown: false }))
 check('stale and ready -> reload', 'reload', decideAfterPoll({ before: 1, next: { process: { pid: 2 }, ready: true }, sawDown: false }))
 check('ready field absent (older host) -> reload', 'reload', decideAfterPoll({ before: 1, next: { process: { pid: 2 } }, sawDown: false }))
+
+console.log('8. the temporary-disable badge reads the Host recovery state')
+check('no recovery -> no ids', '0', recoveryIds({ lastStatus: { supervisor: {} } }).length)
+check('null status -> no ids', '0', recoveryIds({ lastStatus: null }).length)
+check('missing flow -> no ids', '0', recoveryIds(undefined).length)
+check('empty ids -> no ids', '0', recoveryIds({ lastStatus: { supervisor: { recovery: { ids: [] } } } }).length)
+check('one id is surfaced', 'experimental-inspector',
+  recoveryIds({ lastStatus: { supervisor: { recovery: { ids: ['experimental-inspector'] } } } }).join(','))
+check('two ids keep order', 'a,b',
+  recoveryIds({ lastStatus: { supervisor: { recovery: { ids: ['a', 'b'] } } } }).join(','))
+check('non-string ids are dropped', 'a',
+  recoveryIds({ lastStatus: { supervisor: { recovery: { ids: ['a', 5, null, ''] } } } }).join(','))
+check('a bare recovery string does not break it', '0',
+  recoveryIds({ lastStatus: { supervisor: { recovery: 'broken' } } }).length)
+check('{ids} is substituted', 'disabled: a, b', fillIds('disabled: {ids}', ['a', 'b']))
+check('no placeholder left', 'disabled', fillIds('disabled', ['a']))
 
 if (failed === 0) console.log('restart-flow test passed')
 else console.log('restart-flow test failed')
