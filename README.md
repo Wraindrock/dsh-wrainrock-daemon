@@ -116,9 +116,13 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.
 
 `unitName`、`safeUnitName`、`safeProfile`、`safeTemplate`、`failureThreshold`、`failureWindowSeconds`、
 `healthySeconds`、`maxBackoffSeconds`、`port`、`safePort`、`portGuard`、`host`、`extraAppArgs`、`cliPath`、`nodeBin`、
-`homeDir`、`unitDir`、`installOnActivate`、`startAtBoot`、`enableLinger`、`notify`。
+`homeDir`、`unitDir`、`installOnActivate`、`containerOnly`、`startAtBoot`、`enableLinger`、`notify`。
 
 `safePort` 默认是主端口 + 1（安全模式专用）；`portGuard`（默认 `true`）控制「同伴端口识别 + 等待而不升级」这套守卫。
+`containerOnly` 默认在容器里为 `true`：distrobox/podman 下宿主机和容器各有一个 systemd 用户管理器，而它们读的是
+**同一份** `~/.config/systemd/user`——不加限制就会各起一份 unit，容器里的 `systemctl --user` 只看得到自己那份，
+另一份成了看不见的「同伴」。开启后 unit 带 `ConditionVirtualization=container`，宿主机那份直接跳过，只剩容器这一份
+（也就没有双管理器重启的问题）。真想让宿主机也跑，把它设成 `false`。
 
 插件没有声明 Config schema（因此插件管理页不显示配置表单），改动请直接编辑补丁行；每次插件激活都会按当前配置重写脚本与 unit。
 
@@ -167,6 +171,10 @@ bash tests/ladder.sh
 
 `tests/ladder.sh` 18/19 组加了 `systemd-run` 桩：断言助手先跳出 scope、并且 `start` 后确实做了 `is-active`
 校验；5/6 组断言 `relaunch.log` 落盘。46 个断言全绿。
+
+补充（同日）：那两份管理器其实是 distrobox/podman 的宿主机 + 容器各一份，不是配置错误。插件现在给 unit 加
+`ConditionVirtualization=container`（配置项 `containerOnly`，容器里默认开），宿主机那份直接跳过，只剩容器这一份；
+提示文案也改成解释这个布局，不再叫用户「停掉多余的管理器」。`tests/manager-advice.mjs` 锁住这段文案。
 
 **2026-10-17 — 「重启又失败了，他一直不重启」**。症状：点「重启」后页面回 `202`、`state/client-events.jsonl` 里
 `restart:plan` / `restart:result` 都写着 `ok`，但服务实际没动——`systemctl --user show -p MainPID` 前后是同一个 pid，

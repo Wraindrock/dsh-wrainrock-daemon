@@ -34,7 +34,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, lstatSync, unlinkSync, copyFileSync, cpSync, renameSync, statSync, openSync, readSync, closeSync, chmodSync, realpathSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir, userInfo } from 'node:os'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
@@ -205,6 +205,47 @@ function selfCgroup() {
   try { return readFileSync('/proc/self/cgroup', 'utf8') } catch { return '' }
 }
 
+let cachedContainerKind
+
+/**
+ * What kind of container this machine is ('' / 'none' on a real host).
+ *
+ * A distrobox/podman setup has *two* systemd user managers for the same uid —
+ * the host's and the container's — and both read the same
+ * `~/.config/systemd/user`. That is the normal layout, not a broken setting:
+ * `systemctl --user` inside the container only ever reaches the container's
+ * manager, so a unit that both managers start leaves an instance the plugin
+ * cannot see (and the 2026-11-02 restart dead-end came from exactly that).
+ * The units are therefore pinned to the container when one is detected.
+ */
+export function containerKind() {
+  if (cachedContainerKind !== undefined) return cachedContainerKind
+  try {
+    const out = execFileSync('systemd-detect-virt', ['--container'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    cachedContainerKind = out === '' ? 'none' : out
+  } catch {
+    cachedContainerKind = 'none'
+  }
+  return cachedContainerKind
+}
+
+/**
+ * What to say about more than one systemd user manager for this account.
+ * Pure so the wording can be tested: the host+container split must not be
+ * reported as something to "clean up".
+ */
+export function managerAdvice({ ids = [], container = 'none', unitName = 'dsh-wrainrock-daemon.service', port = 0, containerOnly = false } = {}) {
+  if (ids.length <= 1) return undefined
+  const list = ids.join(', ')
+  if (container !== 'none') {
+    const pin = containerOnly
+      ? `The unit is pinned to the container (ConditionVirtualization=container), so the host's manager skips it; `
+      : `Both managers see the same enabled unit, so both may start a supervisor; `
+    return `${ids.length} systemd user managers exist for this account (${list}): the host and the ${container} container each run one. That is the normal distrobox/podman layout, not a misconfiguration to clean up. ${pin}the supervisor lock and the peer-port guard make the second instance wait instead of fighting it.`
+  }
+  return `${ids.length} systemd user managers exist for this account (${list}). Each one starts ${unitName}, so they race for port ${port}; the supervisor lock and the peer-port guard prevent a false safe mode, but stopping the extra manager is still worth doing.`
+}
+
 /**
  * Locate the `dsh` entry script to bake into the generated unit.
  *
@@ -355,6 +396,10 @@ export function createManager(ctx, rawConfig) {
     healthySeconds: asNumber(config.healthySeconds, 120),
     maxBackoffSeconds: asNumber(config.maxBackoffSeconds, 120),
     installOnActivate: asBoolean(config.installOnActivate, true),
+    // In a distrobox/podman setup the host's and the container's user managers
+    // both read this unit file. Pinning it to the container leaves exactly one
+    // instance, and that instance is the one `systemctl --user` here can reach.
+    containerOnly: asBoolean(config.containerOnly, containerKind() !== 'none'),
     startAtBoot: asBoolean(config.startAtBoot, true),
     enableLinger: asBoolean(config.enableLinger, true),
     notify: asBoolean(config.notify, true),
@@ -505,6 +550,9 @@ export function createManager(ctx, rawConfig) {
       SAFE_SUPERVISOR_EXEC: `/bin/bash ${unitExecArg(paths.supervisor)} --force-safe`,
       ENV_DSH_HOME: unitWord(`DSH_HOME=${dshHome}`),
       ENV_PATH: unitWord(`PATH=${dirname(nodeBin())}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`),
+      // Empty on a real host; inside distrobox/podman this keeps the host's
+      // user manager from starting a second instance of the same unit.
+      CONDITION: settings.containerOnly ? 'ConditionVirtualization=container' : '',
     }
   }
 
@@ -651,9 +699,14 @@ export function createManager(ctx, rawConfig) {
       count: ids.length,
       ids,
       duplicate: ids.length > 1,
-      advice: ids.length > 1
-        ? `${ids.length} systemd user managers exist for this account (${ids.join(', ')}). Each one starts ${settings.unitName}, so they race for port ${resolvedPort()}; the supervisor lock and the peer-port guard prevent a false safe mode, but stopping the extra manager is still worth doing.`
-        : undefined,
+      container: containerKind(),
+      advice: managerAdvice({
+        ids,
+        container: containerKind(),
+        unitName: settings.unitName,
+        port: resolvedPort(),
+        containerOnly: settings.containerOnly,
+      }),
     }
   }
 

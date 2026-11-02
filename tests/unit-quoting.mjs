@@ -57,6 +57,7 @@ try {
     ENV_PATH: unitWord('PATH=/usr/local/bin:/usr/bin:/bin'),
     SAFE_UNIT: 'dsh-wrainrock-daemon-safemode.service',
     MAIN_UNIT: 'dsh-wrainrock-daemon.service',
+    CONDITION: '',
   })
 
   console.log('3. ExecStart keeps the spaced path as one argument')
