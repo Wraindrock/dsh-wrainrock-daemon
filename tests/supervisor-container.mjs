@@ -35,7 +35,7 @@ check('container branch logs the normal layout instead of warning', true,
 
 console.log('2. a container render leaves no bare token and no duplicate warning text')
 const render = (values) => source
-  .replace(/@@HOME_DIR@@|@@NODE_BIN@@|@@DSH_CLI@@|@@DSH_HOME@@|@@PROFILE@@|@@SAFE_PROFILE@@|@@SAFE_TEMPLATE@@|@@APP_ARGS@@|@@SAFE_APP_ARGS@@|@@PORT@@|@@SAFE_PORT@@|@@PORT_GUARD@@|@@UNIT_NAME@@|@@FAIL_WINDOW@@|@@FAIL_THRESHOLD@@|@@HEALTHY_SECONDS@@|@@MAX_BACKOFF@@|@@NOTIFY@@/g, (tok) => values[tok] ?? '')
+  .replace(/@@HOME_DIR@@|@@NODE_BIN@@|@@DSH_CLI@@|@@DSH_HOME@@|@@PROFILE@@|@@SAFE_PROFILE@@|@@SAFE_TEMPLATE@@|@@APP_ARGS@@|@@SAFE_APP_ARGS@@|@@PORT@@|@@SAFE_PORT@@|@@PORT_GUARD@@|@@UNIT_NAME@@|@@FAIL_WINDOW@@|@@FAIL_THRESHOLD@@|@@HEALTHY_SECONDS@@|@@MAX_BACKOFF@@|@@NOTIFY@@|@@CRASH_DISABLE@@/g, (tok) => values[tok] ?? '')
   .replace(/@@CONTAINER_KIND@@/g, values['@@CONTAINER_KIND@@'] ?? '')
 const tokens = {
   '@@HOME_DIR@@': '/tmp/home', '@@NODE_BIN@@': '/bin/bash', '@@DSH_CLI@@': '/tmp/dsh',
@@ -44,6 +44,7 @@ const tokens = {
   '@@PORT@@': '3999', '@@SAFE_PORT@@': '4000', '@@PORT_GUARD@@': '1',
   '@@UNIT_NAME@@': 'dsh-wrainrock-daemon.service', '@@FAIL_WINDOW@@': '600',
   '@@FAIL_THRESHOLD@@': '3', '@@HEALTHY_SECONDS@@': '1', '@@MAX_BACKOFF@@': '2', '@@NOTIFY@@': '0',
+  '@@CRASH_DISABLE@@': '1',
 }
 const boxed = render({ ...tokens, '@@CONTAINER_KIND@@': 'podman' })
 check('no bare token survives', false, /@@[A-Z_]+@@/.test(boxed))

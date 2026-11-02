@@ -396,6 +396,11 @@ export function createManager(ctx, rawConfig) {
     healthySeconds: asNumber(config.healthySeconds, 120),
     maxBackoffSeconds: asNumber(config.maxBackoffSeconds, 120),
     installOnActivate: asBoolean(config.installOnActivate, true),
+    // When a crash names one plugin, retry the normal profile once with just
+    // that plugin temporarily disabled (a `--patch` overlay in the state dir,
+    // removed again after a healthy boot) instead of falling straight to safe
+    // mode and dropping the whole plugin set.
+    crashDisable: asBoolean(config.crashDisable, true),
     // In a distrobox/podman setup the host's and the container's user managers
     // both read this unit file. Pinning it to the container leaves exactly one
     // instance, and that instance is the one `systemctl --user` here can reach.
@@ -553,6 +558,7 @@ export function createManager(ctx, rawConfig) {
       // Empty on a real host; inside distrobox/podman this keeps the host's
       // user manager from starting a second instance of the same unit.
       CONDITION: settings.containerOnly ? 'ConditionVirtualization=container' : '',
+      CRASH_DISABLE: settings.crashDisable ? 1 : 0,
       // `containerKind()` returns 'none' on a real host; the shell-side guard
       // keys on the empty string, so map host to ''.
       CONTAINER_KIND: containerKind() === 'none' ? '' : containerKind(),
@@ -1036,6 +1042,11 @@ export function createManager(ctx, rawConfig) {
       lastExit: numeric('last_exit'),
       incident,
       previousIncident: existsSync(join(paths.reportDir, 'latest.md')),
+      // Set only while a temporary crash-recovery overlay is in force: the id
+      // listed here is disabled for this boot only and is re-enabled by the
+      // supervisor as soon as a run stays healthy.
+      recovery: readJson(join(paths.stateDir, 'recovery.json')) ?? undefined,
+      recoveryOverlay: existsSync(join(paths.stateDir, 'recovery-override.yml')) || undefined,
     }
   }
 

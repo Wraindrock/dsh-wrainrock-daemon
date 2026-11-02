@@ -45,6 +45,7 @@ render() {
       -e "s|@@HEALTHY_SECONDS@@|1|g" \
       -e "s|@@MAX_BACKOFF@@|2|g" \
       -e "s|@@NOTIFY@@|0|g" \
+      -e "s|@@CRASH_DISABLE@@|1|g" \
       -e "s|@@CONTAINER_KIND@@||g" \
       "$PLUGIN_DIR/supervisor.sh"
 }
@@ -419,6 +420,40 @@ check "the fallback helper exited cleanly" "0" "$?"
 check "the fallback found the supervisor through systemd" "yes" \
   "$(await_exit "$FAKE3" 5 && echo yes || echo no)"
 kill -TERM "$FAKE3" 2>/dev/null; wait "$FAKE3" 2>/dev/null
+
+echo "20. a single-plugin crash retries the profile with that plugin temporarily disabled"
+prepare
+# Fails with the 2026-11-02 inspector signature until the temporary overlay
+# exists; once it does, the run is healthy and the supervisor must remove it.
+cat >"$SCRATCH/crash-stub.sh" <<EOF
+#!/bin/bash
+if [ -s "$SCRATCH/home/state/recovery-override.yml" ]; then
+  sleep 2
+  exit 0
+fi
+echo "dsh: fatal uncaught exception: Error: inspector: Host source is closed" >&2
+exit 1
+EOF
+chmod +x "$SCRATCH/crash-stub.sh"
+DSH_WRAINROCK_DAEMON_EXEC="$SCRATCH/crash-stub.sh" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 \
+  bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+SUP=$!
+await '[ -s "$SCRATCH/home/state/recovery-override.yml" ]' 30
+check "a temporary overlay was written" "yes" \
+  "$(grep -q 'crash override applied' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+check "the overlay disables the plugin named by the crash" "yes" \
+  "$(grep -q 'id: experimental-inspector' "$SCRATCH/home/state/recovery-override.yml" 2>/dev/null && echo yes || echo no)"
+# The retry itself starts after the supervisor's short pause, so wait for the
+# `--patch` command line to land in the child log instead of racing it.
+await 'grep -q -- "--patch .*recovery-override.yml" "$SCRATCH/home/logs/dsh.out.log"' 20
+check "the normal profile was retried with --patch" "yes" \
+  "$(grep -q -- '--patch .*recovery-override.yml' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null && echo yes || echo no)"
+check "safe mode was not needed" "no" \
+  "$(grep -q safe "$SCRATCH/home/state/mode" 2>/dev/null && echo yes || echo no)"
+await '[ ! -s "$SCRATCH/home/state/recovery-override.yml" ]' 30
+check "the overlay was removed again after a healthy run" "yes" \
+  "$(grep -q 'crash override removed (healthy run)' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+kill -TERM "$SUP" 2>/dev/null; wait "$SUP" 2>/dev/null
 
 if [ "$FAILED" = "0" ]; then
   echo "all supervisor ladder tests passed"
