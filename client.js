@@ -67,8 +67,14 @@ window.__ModuleLoader__.load({
       portSaving: '保存中…',
       portRestarting: '保存并重启中…',
       portSaved: '已保存，下次启动生效',
-      portSavedRestart: '已保存，服务即将重启；页面稍后需要刷新',
+      portSavedRestart: '已保存，服务即将重启；端口有变化时会自动把你带到新端口',
       portFailed: '保存失败',
+      portRestartHint: '改端口会让当前页面失效；「保存并重启」完成后会自动把你带到新端口。',
+      // A tab served by the OLD process keeps running its JS after that process
+      // dies, so it can poll the new port itself and hand the page over.
+      moveWaiting: '端口已改为 {port}，正在等待新地址…',
+      moveOpenNow: '立即打开',
+      moveTimeoutHint: '新地址暂时没有响应；可用「dwd status」查看当前端口，或点上面的「立即打开」重试。',
       // Settings → Daemon: the stable sign-in entry (the launch cookie is bound
       // to host:port, so a port change invalidates the old cookie).
       entryTitle: '登录入口',
@@ -80,6 +86,8 @@ window.__ModuleLoader__.load({
       entryCopyFailed: '复制失败，请手动选中下面的链接',
       entryHint: '端口变更后需重新从这个入口打开（登录 cookie 绑定 host:port）。',
       entryUnavailable: '入口信息不可用',
+      entryDebugLabel: '一次性登录链接（调试用）',
+      entryDebugHint: '进程重启即失效，不要收藏。',
       cloudflareLabel: '转发至 Cloudflare 域名',
       cloudflareBadge: '实验性·开发中',
       cloudflareHint: '占位功能：把本地服务转发到一个 Cloudflare 域名，目前尚未开放，暂时无法开启。',
@@ -115,8 +123,12 @@ window.__ModuleLoader__.load({
       portSaving: 'Saving…',
       portRestarting: 'Saving and restarting…',
       portSaved: 'Saved — takes effect on the next start',
-      portSavedRestart: 'Saved — the service is restarting; reload the page in a moment',
+      portSavedRestart: 'Saved — the service is restarting; if the port changed you will be taken to the new one automatically',
       portFailed: 'Save failed',
+      portRestartHint: 'Changing the port invalidates this page; “Save & restart” moves you to the new port automatically.',
+      moveWaiting: 'Port changed to {port} — waiting for the new address…',
+      moveOpenNow: 'Open now',
+      moveTimeoutHint: 'The new address has not answered yet; run “dwd status” to see the current port, or use “Open now” above to retry.',
       entryTitle: 'Sign-in entry',
       entryIntro: 'Changing the port invalidates the old sign-in; open from this entry to sign in automatically, and bookmark it.',
       entryAddress: 'Entry address',
@@ -126,6 +138,8 @@ window.__ModuleLoader__.load({
       entryCopyFailed: 'Copy failed — select the link below manually',
       entryHint: 'After a port change, open from this entry again (the sign-in cookie is bound to host:port).',
       entryUnavailable: 'Entry information unavailable',
+      entryDebugLabel: 'One-off sign-in link (debug)',
+      entryDebugHint: 'Expires when the process restarts — do not bookmark.',
       cloudflareLabel: 'Forward to a Cloudflare domain',
       cloudflareBadge: 'Experimental · in development',
       cloudflareHint: 'Placeholder: forward this local service to a Cloudflare domain. Not available yet and cannot be enabled for now.',
@@ -181,6 +195,9 @@ window.__ModuleLoader__.load({
 .dsa-url{font-family:var(--dsw-font-family-mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);
   font-size:12px;line-height:18px;word-break:break-all;user-select:text;
   color:var(--dsw-alias-label-secondary)}
+/* Manual escape hatch in the "waiting for the new port" banner. */
+.dsa-link{color:var(--dsw-alias-state-business-primary);text-decoration:underline;
+  text-underline-offset:2px;cursor:pointer}
 .dsa-btn.dsa-primary{border-color:transparent;background:var(--dsw-alias-button-primary-fill);
   color:var(--dsw-alias-label-primary-foreground);font-weight:500}
 .dsa-btn.dsa-primary:hover:not([disabled]){background:var(--dsw-alias-button-primary-hover);
@@ -277,9 +294,13 @@ window.__ModuleLoader__.load({
       return textOf(info?.entry) ?? textOf(info?.current)
     }
 
-    /** URL 复制 uses: the authenticated link when the host has one, else the entry. */
+    /**
+     * URL 复制 uses. The stable entry comes first: it is the link worth keeping,
+     * while the token-bearing `authenticated` link dies with the running process
+     * (it is shown as a secondary, clearly marked debug link).
+     */
     function copyTarget(info) {
-      return textOf(info?.authenticated) ?? entryTarget(info)
+      return textOf(info?.entry) ?? textOf(info?.authenticated)
     }
 
     /** Client-side range check (integer 1..65535); null means "not a valid port". */
@@ -300,6 +321,188 @@ window.__ModuleLoader__.load({
     /** Query string for the save request; `restart=1` asks the host to restart. */
     function portQuery(port, restart) {
       return `/port?port=${port}${restart ? '&restart=1' : ''}`
+    }
+
+    /**
+     * The "I moved to another port" bookmark. A restart gives the page ~250ms
+     * before its own origin dies, so the new port must be written down FIRST
+     * (`writePendingMove` from the save response) and acted on afterwards; the
+     * same marker covers a manual reload that happens before the old process
+     * exits.
+     */
+    const PENDING_KEY = `${NS}:pending`
+    /** 500ms × 60 ≈ 30s: long enough for a cold boot, short enough to give up. */
+    const MOVE_POLL_MS = 500
+    const MOVE_ATTEMPTS = 60
+
+    /** localStorage when the browser allows it; every failure reads as "none". */
+    function pendingStore() {
+      try {
+        const store = typeof window === 'object' && window ? window.localStorage : null
+        return store && typeof store.getItem === 'function' ? store : null
+      } catch {
+        // Storage can be blocked outright (private mode, partitioned frames).
+        return null
+      }
+    }
+
+    /** Raw marker text; '' when unavailable. Never throws. */
+    function readPendingRaw() {
+      const store = pendingStore()
+      if (!store) return ''
+      try {
+        const raw = store.getItem(PENDING_KEY)
+        return typeof raw === 'string' ? raw : ''
+      } catch {
+        return ''
+      }
+    }
+
+    /**
+     * Parse the pending-move marker. Anything short of a valid 1..65535 port
+     * reads as "no move": an empty/absent value, broken JSON, a foreign shape.
+     */
+    function readPendingMove(raw) {
+      if (typeof raw !== 'string' || raw.trim() === '') return { port: 0, at: '' }
+      let data = null
+      try {
+        data = JSON.parse(raw)
+      } catch {
+        return { port: 0, at: '' }
+      }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return { port: 0, at: '' }
+      const port = parsePortInput(data.port)
+      if (port === null) return { port: 0, at: '' }
+      return { port, at: typeof data.at === 'string' ? data.at : '' }
+    }
+
+    /** Remember the port to move to; false when there is no usable storage. */
+    function writePendingMove(port) {
+      const value = parsePortInput(port)
+      if (value === null) return false
+      const store = pendingStore()
+      if (!store) return false
+      try {
+        store.setItem(PENDING_KEY, JSON.stringify({ port: value, at: new Date().toISOString() }))
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    /** Drop the marker once the new port answered (or the move was cancelled). */
+    function clearPendingMove() {
+      const store = pendingStore()
+      if (!store) return
+      try {
+        store.removeItem(PENDING_KEY)
+      } catch {
+        /* nothing to clean up */
+      }
+    }
+
+    /**
+     * Follow a pending move? Only when the target is a valid port AND differs
+     * from the port this page is served from — following a no-op move would
+     * reload the page for nothing.
+     */
+    function decideFollow(input) {
+      const pending = input?.pending
+      const port = pending && typeof pending === 'object' ? parsePortInput(pending.port) : null
+      if (port === null) return { follow: false, port: 0 }
+      const currentPort = parsePortInput(input?.currentPort) ?? 0
+      return { follow: port !== currentPort, port }
+    }
+
+    /** The port this page is served from (0 when unknowable). */
+    function pagePort() {
+      try {
+        if (typeof window !== 'object' || !window || !window.location) return 0
+        return parsePortInput(window.location.port) ?? 0
+      } catch {
+        return 0
+      }
+    }
+
+    /**
+     * Absolute URL of the stable entry on `port`. This is the ONLY address a
+     * move may navigate to: the launch cookie is bound to host:port, so the bare
+     * origin on the new port would answer 401. '' without a DOM to read.
+     */
+    function moveUrl(port) {
+      const value = parsePortInput(port)
+      if (value === null) return ''
+      try {
+        if (typeof window !== 'object' || !window || !window.location) return ''
+        const location = window.location
+        const hostname = typeof location.hostname === 'string' ? location.hostname : ''
+        if (hostname === '') return ''
+        const protocol = typeof location.protocol === 'string' && location.protocol !== ''
+          ? location.protocol
+          : 'http:'
+        return `${protocol}//${hostname}:${value}${BASE}/enter`
+      } catch {
+        return ''
+      }
+    }
+
+    /** Fill the single `{port}` placeholder of a move notice. */
+    function fillPort(template, port) {
+      return String(template).replace('{port}', String(port))
+    }
+
+    /**
+     * Wait for `port` to answer, then hand the page to its entry.
+     *
+     * A `no-cors` fetch is the right probe: it resolves on ANY answer (even an
+     * opaque 401/403) and rejects only while nothing listens there yet, which is
+     * exactly the "is the new process up?" question. The loop is bounded, silent
+     * and deliberately NOT cancelled when the settings panel unmounts — the
+     * panel closing must not strand the user on the dying origin.
+     */
+    function watchPort(port, onGiveUp) {
+      const url = moveUrl(port)
+      let timer = null
+      let done = false
+      let attempts = 0
+      const finish = (moved) => {
+        if (done) return
+        done = true
+        if (timer !== null) { clearTimeout(timer); timer = null }
+        if (!moved) {
+          try { onGiveUp() } catch { /* a failed notice must not throw */ }
+        }
+      }
+      const tick = () => {
+        timer = null
+        if (done) return
+        attempts += 1
+        let request = null
+        try {
+          if (typeof fetch === 'function') request = fetch(url, { mode: 'no-cors', cache: 'no-store' })
+        } catch {
+          request = null
+        }
+        if (!request || typeof request.then !== 'function') { finish(false); return }
+        request.then(() => {
+          // Something answered on the new port: it is up (opaque or not).
+          clearPendingMove()
+          report('move:follow', { port, attempts })
+          try {
+            window.location.replace(url)
+          } catch {
+            finish(false)
+            return
+          }
+          finish(true)
+        }).catch(() => {
+          if (done) return
+          if (attempts >= MOVE_ATTEMPTS) finish(false)
+          else timer = setTimeout(tick, MOVE_POLL_MS)
+        })
+      }
+      if (url === '' || typeof setTimeout !== 'function') { finish(false); return }
+      timer = setTimeout(tick, MOVE_POLL_MS)
     }
 
     /**
@@ -588,8 +791,21 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = React.useState('')
       const [note, setNote] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
+      // Set while this tab is waiting for a port it just moved to.
+      const [move, setMove] = React.useState(null)
       // React.useRef with a stand-in for the dependency-free test stub.
       const live = typeof React.useRef === 'function' ? React.useRef(true) : { current: true }
+
+      /**
+       * Start (or resume) the wait for `port`. The poller deliberately outlives
+       * this panel: the page it lives in is the one about to stop answering.
+       */
+      const startMove = (nextPort) => {
+        if (live.current) setMove({ port: nextPort, timedOut: false })
+        watchPort(nextPort, () => {
+          if (live.current) setMove({ port: nextPort, timedOut: true })
+        })
+      }
 
       const adopt = (next) => {
         if (!live.current) return
@@ -610,6 +826,10 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         live.current = true
         load()
+        // Resuming after a reload: a move this page never finished still counts,
+        // and the tab must not sit on an origin that is about to refuse.
+        const decision = decideFollow({ pending: readPendingMove(readPendingRaw()), currentPort: pagePort() })
+        if (decision.follow) startMove(decision.port)
         return () => { live.current = false }
         // Runs once per mount: the section is remounted whenever it is opened.
       }, [])
@@ -644,6 +864,16 @@ window.__ModuleLoader__.load({
           if (!response.ok) throw new Error(`HTTP ${response.status}`)
           return data
         }).then((data) => {
+          // Record the move BEFORE the liveness guard: the new port has to be
+          // written down even if this panel unmounted while the POST was out,
+          // because the origin dies with the process.
+          if (restart) {
+            const target = data && typeof data === 'object' ? parsePortInput(data.next) : null
+            if (target !== null && decideFollow({ pending: { port: target }, currentPort: pagePort() }).follow) {
+              writePendingMove(target)
+              startMove(target)
+            }
+          }
           if (!live.current) return
           setBusy(false)
           // The save response carries the same state shape, so adopt it; if it is
@@ -709,6 +939,17 @@ window.__ModuleLoader__.load({
               h('button', {
                 type: 'button', className: 'dsa-btn dsa-primary', disabled: busy, onClick: () => submit(true),
               }, t('portSaveRestart'))),
+            h('p', { className: 'dsa-hint' }, t('portRestartHint')),
+            // The move banner outlives the save click: while it is up the page
+            // polls the new port, and the link is the manual escape hatch.
+            move ? h('div', { className: 'dsa-field', 'data-dsa-move': move.timedOut ? 'timeout' : 'waiting' },
+              h('p', { className: 'dsa-hint dsa-warnText' },
+                h('span', null, fillPort(t('moveWaiting'), move.port)),
+                ' ',
+                h('a', {
+                  className: 'dsa-link', href: moveUrl(move.port), 'data-dsa-move-link': '1',
+                }, t('moveOpenNow'))),
+              move.timedOut ? h('p', { className: 'dsa-hint' }, t('moveTimeoutHint')) : null) : null,
             pending ? h('p', { className: 'dsa-hint dsa-warnText', 'data-dsa-pending': '1' }, t('portPending')) : null,
             note ? h('p', {
               className: noteClass, 'data-dsa-note': note.kind, role: 'status',
@@ -798,6 +1039,7 @@ window.__ModuleLoader__.load({
       }
 
       const entry = info ? textOf(info.entry) : null
+      const debug = info ? textOf(info.authenticated) : null
       const openable = entryTarget(info)
       const noteClass = note?.kind === 'ok' ? 'dsa-okText' : 'dsa-errText'
 
@@ -820,6 +1062,12 @@ window.__ModuleLoader__.load({
           }, t('entryOpen')),
           h('button', { type: 'button', className: 'dsa-btn', onClick: copy }, t('entryCopy'))) : null,
         reveal ? h('code', { className: 'dsa-url', 'data-dsa-entry-reveal': '1' }, reveal) : null,
+        // The token link dies with the running process, so it is shown second
+        // and labelled as the throwaway it is — never the link to bookmark.
+        debug && debug !== entry ? h('div', { className: 'dsa-field' },
+          h('span', { className: 'dsa-label' }, t('entryDebugLabel')),
+          h('code', { className: 'dsa-url', 'data-dsa-entry-debug': '1' }, debug),
+          h('p', { className: 'dsa-hint' }, t('entryDebugHint'))) : null,
         note ? h('p', {
           className: noteClass, 'data-dsa-entry-note': note.kind, role: 'status',
         }, note.text) : null)
@@ -923,7 +1171,7 @@ window.__ModuleLoader__.load({
       },
       // Test seam: the restart lifecycle is the part that must not regress and
       // the part a browser cannot be driven into reproducing here.
-      __test: { createRestartFlow, decideAfterPoll, recoveryIds, fillIds, parsePortInput, portSourceKey, portQuery, readPortSnapshot, readEntryInfo, entryTarget, copyTarget },
+      __test: { createRestartFlow, decideAfterPoll, recoveryIds, fillIds, parsePortInput, portSourceKey, portQuery, readPortSnapshot, readEntryInfo, entryTarget, copyTarget, readPendingMove, writePendingMove, clearPendingMove, decideFollow, moveUrl },
     }
   },
 })

@@ -252,6 +252,39 @@ if [ "$PORT" != "$BAKED_PORT" ] || [ "$SAFE_PORT" != "$BAKED_SAFE_PORT" ]; then
   log "port override: port=$PORT ($PORT_SOURCE), safe=$SAFE_PORT ($SAFE_PORT_SOURCE); baked $BAKED_PORT/$BAKED_SAFE_PORT"
 fi
 
+# --- clear our own ports ------------------------------------------------------
+# A tombstone (bin/mover.mjs) can still be holding the port this run wants, which
+# happens whenever the port comes back to an address it once left. The child
+# would then die on EADDRINUSE and the supervisor would count it as a crash, so
+# the tombstone goes first — it is ours, and the process that spawns it records
+# it in state/movers.json for exactly this reason.
+clear_tombstones() {
+  # The daemon can come back to a port it walked away from. A tombstone sitting
+  # on that port would make the launch fail and count as a crash, so it has to
+  # go first. `state/movers.json` is an ordinary file, though: only kill a pid
+  # that really is our mover, never whatever a damaged file happens to name.
+  local file="$STATE_DIR/movers.json" record from pid killed=0 cmd
+  [ -f "$file" ] || return 0
+  while IFS= read -r record; do
+    from="$(printf '%s' "$record" | grep -o '"from"[[:space:]]*:[[:space:]]*[0-9]\+' | grep -o '[0-9]\+' | head -n1)"
+    pid="$(printf '%s' "$record" | grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' | grep -o '[0-9]\+' | head -n1)"
+    [ -n "$from" ] && [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    if [ "$from" = "$PORT" ] || { [ -n "$SAFE_PORT" ] && [ "$from" = "$SAFE_PORT" ]; }; then
+      if [ -r "/proc/$pid/cmdline" ]; then
+        cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+        case "$cmd" in *mover.mjs*) ;; *) continue ;; esac
+      fi
+      if kill "$pid" 2>/dev/null; then
+        killed=$((killed + 1))
+        log "port tombstone on $from (pid $pid) stopped: this run wants that port"
+      fi
+    fi
+  done < <(grep -o '{[^{}]*}' "$file")
+  return 0
+}
+clear_tombstones
+
 # --- singleton lock + peer awareness -----------------------------------------
 # Two systemd *user managers* for one account (for example user@1000.service AND
 # user@ian.service) both start this unit, so two supervisors race for one

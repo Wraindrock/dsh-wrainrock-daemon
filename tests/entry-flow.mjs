@@ -79,6 +79,28 @@ function serve(manager) {
   })
 }
 
+// Does anything answer on that port at all? (A tombstone, the daemon, whatever.)
+async function answers(port) {
+  try {
+    await fetch(`http://127.0.0.1:${port}/`, { redirect: 'manual', signal: AbortSignal.timeout(1500) })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// The tombstone is a separate process: give it a moment to bind.
+async function waitForRedirect(port, attempts = 40) {
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/`, { redirect: 'manual', signal: AbortSignal.timeout(1000) })
+      if (response.status === 302) return response
+    } catch { /* not listening yet */ }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  return null
+}
+
 function origin() { return `http://127.0.0.1:${server.address().port}` }
 
 async function get(path, headers = {}) {
@@ -192,10 +214,49 @@ try {
   const cliText = readFileSync(cliShim, 'utf8')
   check('install left no template placeholder behind', false, /@@[A-Z_]+@@/.test(cliText))
   const runDwd = async (...args) => (await execFileAsync(cliShim, args, { timeout: 20000 })).stdout.trim()
-  check('dwd url', `${origin()}/?token=${TOKEN}`, await runDwd('url'))
+  // `dwd url` hands out the link to keep (the entry), not the one-shot token
+  // URL: the token belongs to one process and dies with it.
+  check('dwd url is the stable entry', `${origin()}/dsh-wrainrock-daemon/enter`, await runDwd('url'))
+  check('dwd url --token is the one-shot link', `${origin()}/?token=${TOKEN}`, await runDwd('url', '--token'))
   check('dwd enter', `${origin()}/dsh-wrainrock-daemon/enter`, await runDwd('enter'))
   check('dwd status still works', true, (await runDwd('status')).includes('当前端口'))
+  check('dwd status shows the entry', true, (await runDwd('status')).includes('/dsh-wrainrock-daemon/enter'))
   check('the install reported the shim', true, (cliInstall.changed ?? []).includes('dwd'))
+  await new Promise((resolve) => server.close(resolve))
+
+  // 10. the port tombstone: a browser left on the previous port finds its way.
+  //     This is the case that stranded the user: the port changes, the old
+  //     origin dies, and the tab that was open says nothing about where to go.
+  const moveHome = join(root, 'move-home')
+  const first = makeManager({ homeDir: moveHome })
+  const portA = await serve(first)
+  first.syncMovers()
+  check('the first start records its own port', portA, (await first.status()).mover.previousPort)
+  check('the first start leaves no tombstone', 0, (await first.status()).mover.records.length)
+  await new Promise((resolve) => server.close(resolve))
+
+  const second = makeManager({ homeDir: moveHome })
+  const portB = await serve(second)
+  const plan = second.syncMovers()
+  check('the abandoned port is covered', `${portA}`, plan.spawn.join(','))
+  check('the tombstone script is on disk', true, existsSync(second.paths.mover))
+  const moved = await waitForRedirect(portA)
+  check('a stale address is answered', 302, moved?.status)
+  check('the redirect names the new entry', `http://127.0.0.1:${portB}/dsh-wrainrock-daemon/enter`, moved?.headers.get('location'))
+  const landed = await fetch(moved.headers.get('location'), { redirect: 'manual' })
+  check('the entry logs the browser in', 303, landed.status)
+  check('the entry sets a fresh cookie', COOKIE, landed.headers.getSetCookie()[0]?.split(';')[0])
+  const recorded = (await second.status()).mover.records
+  check('the tombstone is recorded', `${portA}`, recorded.map((entry) => entry.from).join(','))
+  check('the tombstone is a real process', true, recorded.every((entry) => entry.pid > 0))
+
+  // ... and it lets go of the port when the daemon wants it back.
+  const third = makeManager({ homeDir: moveHome, moverOnPortChange: false })
+  third.bindPort(portB)
+  third.syncMovers()
+  check('turning it off clears the tombstones', 0, (await third.status()).mover.records.length)
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  check('the abandoned port goes quiet again', false, await answers(portA))
   await new Promise((resolve) => server.close(resolve))
 
   console.log(failed === 0 ? '\nall entry-flow assertions passed' : '\nSOME entry-flow assertions FAILED')
@@ -203,6 +264,18 @@ try {
   failed = 1
   console.log(`FAIL entry-flow harness threw: ${error?.stack ?? error}`)
 } finally {
+  // Tombstones outlive the test process: kill them before the temp home (and
+  // the script they run) disappears.
+  try {
+    const file = join(homeDir, 'state', 'movers.json')
+    const other = join(root, 'move-home', 'state', 'movers.json')
+    for (const candidate of [file, other]) {
+      if (!existsSync(candidate)) continue
+      for (const entry of JSON.parse(readFileSync(candidate, 'utf8')).movers ?? []) {
+        try { process.kill(entry.pid, 'SIGTERM') } catch { /* already gone */ }
+      }
+    }
+  } catch { /* best effort */ }
   try { server?.close() } catch { /* already closed */ }
   rmSync(root, { recursive: true, force: true })
 }

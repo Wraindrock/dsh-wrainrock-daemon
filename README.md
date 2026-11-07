@@ -100,7 +100,7 @@ dwd rp 3081                # 把「下次启动端口」设为 3081（别名：d
 dwd rp 3081 --no-restart   # 只改「下次启动端口」，现在不重启
 dwd rp 3081 --safe-port 3099   # 顺带指定下次启动的安全模式端口
 dwd restart                # 现在就重启（同面板「重启」按钮）
-dwd url [--open]           # 打印/打开当前带 token 的登录链接（过渡与备用）
+dwd url [--open]           # 打印/打开当前进程的带 token 链接（只用于当场调试；重启即作废）
 dwd enter [--open]         # 打印/打开稳定入口 /dsh-wrainrock-daemon/enter
 dwd help                   # 用法
 ```
@@ -125,9 +125,12 @@ echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc   # bash 用 ~/.bashrc
 ~/.dsh/wrainrock-daemon/bin/supervisor.sh                    # 看护脚本（由插件生成，勿手改）
 ~/.dsh/wrainrock-daemon/bin/relaunch.sh                      # 手动实例的接管助手
 ~/.dsh/wrainrock-daemon/bin/dwd                              # 命令行工具（cliDir 里的 dwd / dsh-wrainrock-daemon 软链接指向它）
+~/.dsh/wrainrock-daemon/bin/mover.mjs                        # 旧端口上的搬家提示服务（只回 302，见「改了端口以后会怎样」）
 ~/.dsh/wrainrock-daemon/state/                               # mode / failures / last_exit / incident.json
 ~/.dsh/wrainrock-daemon/state/port.json                      # 「下次启动端口」唯一事实来源：{port, safePort, at, by}
 ~/.dsh/wrainrock-daemon/state/runtime.json                   # 当前运行实例：{pid, port, safePort, unit, profile, at}
+~/.dsh/wrainrock-daemon/state/last-port.json                 # 上次激活时监听的端口：{port, at}
+~/.dsh/wrainrock-daemon/state/movers.json                    # 留在旧端口上的搬家服务：{movers:[{from, pid, at}]}
 ~/.dsh/wrainrock-daemon/state/entry.json                     # key 模式的入口密钥：{key, at}（缺失/非法则入口拒绝 key 请求）
 ~/.dsh/wrainrock-daemon/state/supervisor-<profile>-<port>.lock   # 看护单例锁（flock，进程退出即释放）
 ~/.dsh/wrainrock-daemon/backup/                              # 最近一次能正常组合的 profile 配置快照
@@ -190,16 +193,28 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.
 | `GET /?token=<错误 token>` | `401` |
 
 **关键前提**：登录凭据绑在 `host:port` 上，而 token 每次重启都换 —— 所以「收藏带 token 的地址」和
-「收藏裸端口」都留不住。daemon 因此提供**稳定入口** `GET /dsh-wrainrock-daemon/enter`：由服务端自己完成上面那次
-token 交换（取回当前进程的 token 链接、把 `Set-Cookie` 透传给浏览器）再 `303` 到 `./`。
-浏览器地址栏里**不出现 token**，可以长期收藏；换端口时只改 URL 里的端口这一个数字，cookie 由入口自动续上。
-另有 `GET /dsh-wrainrock-daemon/url` 回 `{ok:true, current, authenticated|null, entry, mode, port}`
-（`current` 是当前带 token 链接，`entry` 是稳定入口，`authenticated` 是「本次请求是否已带有效 cookie」）。
+「收藏裸端口」都留不住。本机实测过这一点：`logs/dsh.out.log` 里同一个端口 26117 前后出现过**两行不同的 token**，
+其中旧的那一行不管端口对不对，一律回 `401 dsh web authentication required; reopen the URL printed by dsh web.`，
+只有**当前这个进程**打印的那一行能换到 cookie（`303`）。也就是说：把带 token 的链接留在地址栏里刷新必然 401，
+改端口、崩溃重拉、`systemctl` 重启都会让它当场作废。
+
+所以**给人用的主链接是稳定入口，不是带 token 的链接**。daemon 提供 `GET /dsh-wrainrock-daemon/enter`：
+由服务端自己完成上面那次 token 交换（**每次请求都向 DSH 现取一个新 token**、把 `Set-Cookie` 透传给浏览器）
+再 `303` 到 `./`。浏览器地址栏里**不出现 token**，可以长期收藏；换端口时只改 URL 里的端口这一个数字
+（或者干脆用下面「改了端口以后会怎样」里的搬家提示服务），cookie 由入口自动续上。带 token 的地址只当
+**当场调试用**：它等价于日志里那一行，重启即失效，别存进书签。
+
+另有 `GET /dsh-wrainrock-daemon/url` 回
+`{ok:true, current, authenticated|null, authenticatedSource, entry, mode, port, gate}`：`current` 是干净的界面地址
+（形如 `http://127.0.0.1:<port>/`），`entry` 是上面那个稳定入口，`authenticated` 是本进程可用的带 token 链接
+（拿不到时为 `null`），`authenticatedSource` 说明它从哪来 —— `connection` 表示由 DSH 的 connection 服务直接给出
+（可靠），`log` 表示是从 `logs/dsh.out.log` 里捞的、**可能已经过期**，`null` 表示没有；`gate` 是入口对**本次请求**
+的判定（`ok` / `not-loopback` / `key-missing` / `key-invalid`）。
 
 命令行两条路：
 
 ```bash
-dwd url                    # 打印当前带 token 的登录链接（过渡与备用；重启后作废）
+dwd url                    # 打印当前进程的带 token 链接（只用于当场调试；重启后作废）
 dwd url --open             # 直接打开它
 dwd enter                  # 打印稳定入口 http://127.0.0.1:3080/dsh-wrainrock-daemon/enter
 dwd enter --open           # 直接打开稳定入口
@@ -240,6 +255,50 @@ dwd enter --open           # 直接打开稳定入口
    必须改成 `enterMode: 'key'`（入口 URL 带 `?k=…`），或者 `enterMode: 'open'` 并**同时**在外层套 Cloudflare Access；
 4. 别忘了 cookie 会绑定**公网 authority**：换域名、换端口都会让已交换的 cookie 失效，需要重新走一次入口。
 
+## 改了端口以后会怎样（端口搬迁）
+
+**问题**：端口从 A 改到 B 重启后，旧进程已经退出，旧地址（A 端口）直接 `connection refused`——
+浏览器只给你一句「无法访问此网站」，不告诉你新端口在哪；手边存的书签、还开着的旧标签页于是都成了死路，
+用户被卡在中间。上一次「登录与入口」的两个坑也在同一时刻爆发：旧 token 链接重启即 401，cookie 名绑定的
+authority 从 `127.0.0.1:A` 变成 `127.0.0.1:B` 后同样失效。
+
+**现在**：只要端口真的变了，daemon 会在**刚被放弃的旧端口**上留一个极小的「搬家提示服务」
+（`bin/mover.mjs`）。它只做一件事：对任何请求回 `302` 到
+`http://127.0.0.1:<当前端口>/dsh-wrainrock-daemon/enter`——当前端口每次请求都现读 `state/runtime.json`
+（读不到就退回启动参数 `--to`）。于是任何旧地址——书签、旧标签页刷新、手输的旧端口——都会被自动送到
+**新端口**的登录入口；入口再向 DSH 现取一个 token、种下绑定新 `host:port` 的 cookie。用户全程不需要
+知道新端口号。搬家服务不复用任何旧凭据，两个坑因此一起绕过了。
+
+设置页改端口时也会配合：点「保存并重启」后页面显示 `端口已改为 {port}，正在等待新地址…` 并开始轮询
+新端口的入口，新进程一应答就自动跳到新地址；万一没等到，横幅里还留着一个手动打开的链接
+（具体实现见 `client.js` 的 `moveWaiting` 文案）。
+
+状态与开关：
+
+- `state/movers.json` = `{ "movers": [ {"from":<int>,"pid":<int>,"at":"<ISO>"} ] }`：记录当前留在哪些旧端口上、
+  分别是哪个进程。守护进程每次启动都据此收敛一次——该杀的杀、该补的补（例如同一旧端口重复记录只留一个，
+  已被当前进程占用的旧端口记录直接清掉）。
+- `state/last-port.json` = `{ "port":<int>, "at":"<ISO>" }`：上次激活时实际监听的端口，用来判断「这一次
+  是不是真的换了端口」以及该在哪个旧端口上补搬家服务。
+- 配置 `moverOnPortChange`（默认 `true`）：关掉后不再起新的搬家服务，并把已记录在案的都杀掉；此后旧地址
+  就真的打不开了。
+
+安全边界：搬家服务只绑 `127.0.0.1`，不对局域网或公网暴露；**只回一个 `302` 跳转**（连转发目标都没有时
+回一句 `503`），不提供任何内容，也不碰 DSH 的鉴权面；旧端口若已被别的进程占用，它当场静默退出，绝不抢端口；
+`moverOnPortChange: false` 或插件卸载时会把它停掉。`state/movers.json` 只是一份普通文件，所以停掉之前
+都要确认那个 pid 真的是 `mover.mjs`（`/proc/<pid>/cmdline`）——文件损坏时也绝不会杀到无关进程。
+
+如果 daemon 后来**又要回自己曾经放弃的端口**（例如用户把端口改回去），看护会在启动前先让路：它读
+`state/movers.json`，把占着它要用的那个端口的墓碑停掉，日志里留一句
+`port tombstone on <端口> (pid <pid>) stopped: this run wants that port`，否则墓碑会让子进程
+`EADDRINUSE` 崩掉、白白计一次失败。
+
+排查时可以手动起一份：
+
+```bash
+node ~/.dsh/wrainrock-daemon/bin/mover.mjs --from 3080 --to 3081 --home ~/.dsh/wrainrock-daemon
+```
+
 ## 恢复阶梯
 
 1. **启动前校验**：`dsh --profile web --dump-config`。失败 → 把坏配置留档到 `reports/broken-*`，用 `backup/` 里的快照恢复并继续启动；恢复后仍不行 → 直接进安全模式。
@@ -259,11 +318,14 @@ dwd enter --open           # 直接打开稳定入口
 `unitName`、`safeUnitName`、`safeProfile`、`safeTemplate`、`failureThreshold`、`failureWindowSeconds`、
 `healthySeconds`、`maxBackoffSeconds`、`port`、`safePort`、`portGuard`、`host`、`extraAppArgs`、`cliPath`、`nodeBin`、
 `cliDir`、`homeDir`、`unitDir`、`installOnActivate`、`containerOnly`、`startAtBoot`、`enableLinger`、`notify`、
-`enterMode`、`entryKey`。
+`enterMode`、`entryKey`、`moverOnPortChange`。
 
 `enterMode` 控制稳定入口 `GET /enter` 的放行策略：`loopback`（默认，只服务直连回环且无转发头）、
 `key`（额外要求 `?k=` 等于入口密钥）、`open`（不限制来源，仅在另有访问控制时使用）。`entryKey` 是 key 模式
 使用的密钥，留空/非法时以 `state/entry.json` 里那份随机密钥为准（见「登录与入口」一节）。
+
+`moverOnPortChange`（默认 `true`）控制端口变更后是否在旧端口留一个只回 `302` 的搬家提示服务；设成 `false`
+则不再新建、并把已有的都停掉（见「改了端口以后会怎样」一节）。
 
 `cliDir`（默认 `$HOME/bin`）是放置 `dwd` / `dsh-wrainrock-daemon` 两个软链接的目录，改它不会移动
 `<homeDir>/bin/dwd` 本体，只换链接位置。
@@ -299,10 +361,14 @@ bash tests/ladder.sh
 不触碰真实 profile 与真实 unit。另有 `node tests/restart-plan.mjs`（重启决策）、`node tests/migration.mjs`（改名迁移）、
 `node tests/port-state.mjs`（端口取值解析、`state/port.json` 覆盖文件的读取、端口快照 `current/next/pending/source` 优先级）
 与 `node tests/entry-state.mjs`（登录入口纯函数：`peerIsDirectLoopback` 的回环/转发头判定、`entryGate` 三种 mode、
-`buildEntryUrl` 的拼法、`entryKeyOf` 对 `state/entry.json` 的读取），
+`buildEntryUrl` 的拼法、`entryKeyOf` 对 `state/entry.json` 的读取）、
+`node tests/mover-state.mjs`（端口搬迁纯函数：`state/movers.json` 的读取容错、`planMovers` 的 kill/spawn/keep 决策）、
 以及 `node tests/entry-flow.mjs`（登录入口端到端：伪造的 `dsh web` 鉴权面与守护进程自己的路由跑在同一个端口上，
 验证裸路径 401、`/url` 的三个地址、`/enter` 的 `303` + 真实 `Set-Cookie`、经代理时 403、`enterMode=key` 的密钥校验、
-拿不到 cookie 时回退 `302`，最后真装一份 `dwd` 跑 `url` / `enter` / `status`）。
+拿不到 cookie 时回退 `302`，最后真装一份 `dwd` 跑 `url` / `enter` / `status`），
+以及 `bash tests/tombstone-supervisor.sh`（端口墓碑真进程实测：起一个真的 `mover.mjs` 占住旧端口，
+再让真的 `supervisor.sh` 回到那个端口，验证它先停掉墓碑再启动、启动命令行用的是覆盖后的端口，
+并且损坏的 `state/movers.json` 里写着的无关进程不会被杀）。
 
 ## 修复记录
 
@@ -426,6 +492,9 @@ systemctl --user show dsh-wrainrock-daemon.service -p MainPID --value   # 应等
   + 端口状态测试（`node tests/port-state.mjs`：解析 `0`/`65536`/`-1`/`'abc'`/`''`/`null`/`3080`/`'3080'`/`' 3080 '`/`'3080.5'`，
     `state/port.json` 缺失/合法/坏 JSON/越界/`safePort:null`，以及快照 `live > override > config` 的优先级与 `pending` 判定）
   + 登录入口测试（`node tests/entry-state.mjs`：回环 peer 与各转发头、三种 `enterMode`、入口 URL 拼接与 `state/entry.json` 读取）
+  + 端口搬迁测试（`node tests/mover-state.mjs`：`state/movers.json` 缺失/坏 JSON/非数组/非法条目/多条记录，
+    `planMovers` 在 `moverOnPortChange=false`、旧端口重复记录、`previousPort` 非法（`0`/`65536`/`'abc'`）或等于当前端口、
+    以及正常搬迁时的 kill/spawn/keep）
   + 登录入口端到端测试（`node tests/entry-flow.mjs`），并对着**本机真实运行的 3080 实例**验证过：
     `GET /dsh-wrainrock-daemon/enter` → `303 location: /`，拿到的 `dsh-auth-…` cookie 名正好等于
     `b64url(sha256(浏览器看到的 authority))`（即端口/域名换了就得重新从入口进）；token 不对时回退 `302` 到带 token 的地址；
@@ -437,7 +506,8 @@ systemctl --user show dsh-wrainrock-daemon.service -p MainPID --value   # 应等
   拆成两个词、`/bin/bash /var/.../deepseek` 退出 127，再触发 `StartLimitBurst` 与
   `OnFailure=` 安全模式循环；`node tests/unit-quoting.mjs` 覆盖这条回归。
 
-未验证：不同发行版/桌面环境下的表现；非 fnm 安装 node 的路径布局。
+未验证：不同发行版/桌面环境下的表现；非 fnm 安装 node 的路径布局；端口搬迁提示服务在真实改端口
+链路里的端到端行为（`tests/mover-state.mjs` 覆盖的是纯函数，搬家服务本身只做了「只绑回环、只回 302」的代码审查）。
 
 ## 安装（从 GitHub）
 
@@ -450,7 +520,7 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 
 ### 升级
 
-每个发布版本都打 tag（当前 `v0.3.0`，与 `package.json` 的 `version` 一致）并发布为 GitHub Release。
+每个发布版本都打 tag（当前 `v0.3.1`，与 `package.json` 的 `version` 一致）并发布为 GitHub Release。
 升级有两条路：
 
 **1. 市场（dshmarket）里一键升级。** 对 `github:` spec 的安装，市场比较「默认分支 HEAD 上
@@ -471,7 +541,7 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 要钉住某个发布版本，把 tag 写在 spec 后面：
 
 ```bash
-dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.3.0
+dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.3.1
 ```
 
 两条路装完都要点一次界面上的「重启」（或等下次开机），运行中的实例才会换成新版。

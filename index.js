@@ -338,6 +338,77 @@ export function buildEntryUrl(origin, { mode = 'loopback', key = '', prefix = RO
   return `${url}?k=${encodeURIComponent(key)}`
 }
 
+// --- port tombstones ---------------------------------------------------------
+
+/**
+ * Where the abandoned ports are recorded.
+ *
+ * A port change kills the old origin, and a bookmark or an open tab on it says
+ * nothing about where the daemon went. The host half therefore leaves one tiny
+ * `mover.mjs` on every port it leaves behind; these helpers decide which of
+ * them are still wanted. The planning is pure so it can be tested without
+ * starting anything.
+ */
+export function moverRecordPath(paths) {
+  return join(paths.stateDir, 'movers.json')
+}
+
+/** The recorded tombstones, with anything malformed dropped rather than thrown. */
+export function readMoverRecords(paths, options = {}) {
+  const file = options.file ?? moverRecordPath(paths)
+  const raw = readText(file)
+  if (raw === undefined || raw.trim() === '') return []
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.movers) ? parsed.movers : []
+  const records = []
+  for (const entry of list) {
+    if (entry === null || typeof entry !== 'object') continue
+    const from = parsePortValue(entry.from)
+    const pid = Number.isInteger(entry.pid) ? entry.pid : Number.parseInt(String(entry.pid ?? ''), 10)
+    if (from === 0 || !Number.isInteger(pid) || pid <= 0) continue
+    records.push({ from, pid, at: typeof entry.at === 'string' ? entry.at : '' })
+  }
+  return records
+}
+
+/**
+ * Which tombstones to keep, which to drop, and which port to cover next.
+ *
+ * `previousPort` is the port this daemon used last time (state/last-port.json):
+ * it is the one somebody's browser is still pointing at, so it gets a tombstone
+ * unless it is the port we are on now or one is already there.
+ */
+export function planMovers({ records = [], previousPort = 0, currentPort = 0, enabled = true } = {}) {
+  const list = Array.isArray(records) ? records : []
+  if (enabled !== true) {
+    return { kill: list.map((record) => record.pid), spawn: [], keep: [] }
+  }
+  const current = parsePortValue(currentPort)
+  const previous = parsePortValue(previousPort)
+  const kill = []
+  const keep = []
+  const kept = new Set()
+  for (const record of list) {
+    const from = parsePortValue(record?.from)
+    const pid = Number.isInteger(record?.pid) ? record.pid : 0
+    if (pid <= 0) continue
+    if (from === 0 || from === current || kept.has(from)) {
+      kill.push(pid)
+      continue
+    }
+    kept.add(from)
+    keep.push({ from, pid })
+  }
+  const spawn = []
+  if (previous > 0 && previous !== current && !kept.has(previous)) spawn.push(previous)
+  return { kill, spawn, keep }
+}
+
 /** Replace `@@TOKEN@@` placeholders in a shipped template. */
 function render(template, values) {
   return template.replace(/@@([A-Z_]+)@@/g, (match, key) => {
@@ -632,6 +703,9 @@ export function createManager(ctx, rawConfig) {
     })(),
     // Explicit key; when empty, key mode generates one into state/entry.json.
     entryKey: asString(config.entryKey, ''),
+    // Leave a redirect on a port this daemon abandons, so a tab or a bookmark
+    // pointing at the old port is carried to the new one instead of dying.
+    moverOnPortChange: asBoolean(config.moverOnPortChange, true),
     // Names this project used before it was called dsh-wrainrock-daemon. An
     // install made under any of them migrates itself on the first install()
     // (see migrateLegacy), so upgrading machines need no manual step.
@@ -660,7 +734,9 @@ export function createManager(ctx, rawConfig) {
     supervisor: join(homeDir, 'bin', 'supervisor.sh'),
     relaunch: join(homeDir, 'bin', 'relaunch.sh'),
     cli: join(homeDir, 'bin', 'dwd'),
+    mover: join(homeDir, 'bin', 'mover.mjs'),
     entry: join(homeDir, 'state', 'entry.json'),
+    lastPort: join(homeDir, 'state', 'last-port.json'),
     stateDir: join(homeDir, 'state'),
     reportDir: join(homeDir, 'reports'),
     logDir: join(homeDir, 'logs'),
@@ -794,6 +870,135 @@ export function createManager(ctx, rawConfig) {
     } catch { /* the CLI falls back to systemd when this is missing */ }
   }
 
+  // --- the port we came from ------------------------------------------------
+
+  /** The port this daemon ran on last time, or null when that is not known. */
+  function readLastPort() {
+    const raw = readText(paths.lastPort)
+    if (raw === undefined || raw.trim() === '') return null
+    try {
+      const parsed = JSON.parse(raw)
+      const port = parsePortValue(parsed?.port)
+      if (port === 0) return null
+      return { port, at: typeof parsed.at === 'string' ? parsed.at : '' }
+    } catch {
+      return null
+    }
+  }
+
+  function writeLastPort(port) {
+    try {
+      ensureDir(paths.stateDir)
+      writeFileSync(paths.lastPort, `${JSON.stringify({ port, at: new Date().toISOString() }, null, 2)}\n`, 'utf8')
+    } catch { /* the next start simply does not know where it came from */ }
+  }
+
+  /**
+   * Whether this pid is one of our tombstones.
+   *
+   * `state/movers.json` is a plain file in a state directory, so it can hold a
+   * pid that was never ours: the script name in `/proc/<pid>/cmdline` is the
+   * only thing that makes killing it safe. Everything here errs towards "no".
+   */
+  function moverAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0 || pid > 4194304) return false
+    try {
+      process.kill(pid, 0)
+    } catch (error) {
+      if (error?.code !== 'EPERM') return false
+    }
+    try {
+      return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('mover.mjs')
+    } catch {
+      return false
+    }
+  }
+
+  function writeMoverRecords(list) {
+    try {
+      ensureDir(paths.stateDir)
+      writeIfChanged(moverRecordPath(paths), `${JSON.stringify({ movers: list }, null, 2)}\n`, 0o644)
+    } catch (error) {
+      warn(`could not record the port tombstones: ${error?.message ?? error}`)
+    }
+  }
+
+  function stopMover(pid) {
+    try {
+      process.kill(pid, 'SIGTERM')
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  function startMover(from, to) {
+    try {
+      ensureDir(paths.binDir)
+      // install() writes this too; a machine with installOnActivate=false has
+      // still earned a working tombstone.
+      writeIfChanged(paths.mover, template('mover.mjs'), 0o644)
+      const child = spawn(
+        nodeBin(),
+        [paths.mover, '--from', String(from), '--to', String(to), '--home', homeDir, '--prefix', ROUTE_PREFIX],
+        { detached: true, stdio: 'ignore' },
+      )
+      child.unref()
+      return Number.isInteger(child.pid) ? child.pid : 0
+    } catch (error) {
+      warn(`could not leave a redirect on port ${from}: ${error?.message ?? error}`)
+      return 0
+    }
+  }
+
+  function stopAllMovers(reason) {
+    const records = readMoverRecords(paths).filter((record) => moverAlive(record.pid))
+    let stopped = 0
+    for (const record of records) if (stopMover(record.pid)) stopped += 1
+    if (records.length > 0 || readText(moverRecordPath(paths)) !== undefined) writeMoverRecords([])
+    if (stopped > 0) info(`port tombstones stopped (${reason}): ${stopped}`)
+    return stopped
+  }
+
+  /**
+   * Keep one redirect alive per port this daemon has abandoned.
+   *
+   * Called on activation, once the live port is known: the port we used last
+   * time is exactly the one somebody's browser is still pointing at.
+   */
+  function syncMovers() {
+    const previous = readLastPort()
+    const current = portState().current
+    if (current > 0) writeLastPort(current)
+    if (current <= 0) {
+      stopAllMovers('no live port')
+      return { spawn: [], kill: [], keep: [] }
+    }
+    const enabled = settings.moverOnPortChange === true
+    const alive = readMoverRecords(paths).filter((record) => moverAlive(record.pid))
+    const plan = planMovers({ records: alive, previousPort: previous?.port ?? 0, currentPort: current, enabled })
+    for (const pid of plan.kill) stopMover(pid)
+    const records = plan.keep.map((record) => ({ from: record.from, pid: record.pid, at: '' }))
+    for (const from of plan.spawn) {
+      const pid = startMover(from, current)
+      if (pid > 0) records.push({ from, pid, at: new Date().toISOString() })
+    }
+    writeMoverRecords(
+      records.map((record) => ({
+        from: record.from,
+        pid: record.pid,
+        at: record.at === '' ? new Date().toISOString() : record.at,
+      })),
+    )
+    if (plan.spawn.length > 0 || plan.kill.length > 0) {
+      recordEvent('host', 'mover', { spawn: plan.spawn, kill: plan.kill, keep: records.map((record) => record.from) })
+    }
+    if (plan.spawn.length > 0 && records.length > 0) {
+      info(`port tombstones: ${records.map((record) => record.from).join(', ')} -> ${current}`)
+    }
+    return plan
+  }
+
   // --- browser entry ---------------------------------------------------------
 
   /** The entry key in force: the config value first, then state/entry.json. */
@@ -854,7 +1059,20 @@ export function createManager(ctx, rawConfig) {
    * redirects the child's stdout there, so the same URL is in our own log).
    */
   function authenticatedUrl(origin) {
-    if (origin === '') return null
+    return authenticatedTarget(origin).url
+  }
+
+  /**
+   * The same URL, plus where it came from.
+   *
+   * `source` matters because the two differ in lifetime: a token from the
+   * connection service belongs to this process, while one recovered from the
+   * log may belong to a process that has already restarted — it is a hint, not
+   * a guarantee. The stable entry URL (GET <prefix>/enter) is the one to hand
+   * to a person.
+   */
+  function authenticatedTarget(origin) {
+    if (origin === '') return { url: null, source: null }
     const base = `${origin}/`
     const connection = typeof ctx.get === 'function' ? ctx.get('connection') : undefined
     for (const candidate of [connection, connection?.browserAuth]) {
@@ -862,21 +1080,32 @@ export function createManager(ctx, rawConfig) {
       if (typeof candidate.authenticatedUrl !== 'function') continue
       try {
         const url = candidate.authenticatedUrl(base)
-        if (typeof url === 'string' && url !== '') return url
+        if (typeof url === 'string' && url !== '') return { url, source: 'connection' }
       } catch (error) {
         warn(`the authentication url is unavailable: ${error?.message ?? error}`)
       }
     }
-    return tokenUrlFromLog(origin)
+    const fromLog = tokenUrlFromLog(origin)
+    return { url: fromLog, source: fromLog === null ? null : 'log' }
   }
 
-  /** The `dsh web: <url>` line the child printed on its way up. */
+  /**
+   * The `dsh web: <url>` line the child printed on its way up.
+   *
+   * Only a line for the port we are actually on counts: the log keeps every
+   * start, and a token from a previous process is already dead. Among those,
+   * the last one wins — that is the newest start of this port.
+   */
   function tokenUrlFromLog(origin) {
     const text = tailFile(paths.dshLog, 400)
     if (text === '') return null
-    const matches = [...text.matchAll(/dsh web:\s*https?:\/\/\S+\?token=([A-Za-z0-9_-]+)/g)]
+    const matches = [...text.matchAll(/dsh web:\s*https?:\/\/127\.0\.0\.1:([0-9]+)\/\?token=([A-Za-z0-9_-]+)/g)]
     if (matches.length === 0) return null
-    return `${origin}/?token=${matches[matches.length - 1][1]}`
+    const live = portState().current
+    const mine = matches.filter((match) => Number(match[1]) === live)
+    const pool = mine.length > 0 ? mine : matches
+    const chosen = pool[pool.length - 1]
+    return `${origin}/?token=${chosen[2]}`
   }
 
   /** What `/url` and `status.url` report. */
@@ -887,9 +1116,14 @@ export function createManager(ctx, rawConfig) {
     // No request object means an internal caller: there is no socket to judge,
     // so the peer check is skipped rather than failed.
     const gate = req === undefined ? { ok: true, mode } : entryGate({ mode, key, req })
+    const target = gate.ok ? authenticatedTarget(origin) : { url: null, source: null }
     return {
       current: origin === '' ? '' : `${origin}/`,
-      authenticated: gate.ok ? authenticatedUrl(origin) : null,
+      authenticated: target.url,
+      // "connection" is this process's own token; "log" is recovered from a
+      // start that may already be gone, so a caller should not treat it as
+      // durable.
+      authenticatedSource: target.source,
       entry: buildEntryUrl(origin, { mode, key }),
       mode,
       port: portState().current,
@@ -1242,6 +1476,9 @@ export function createManager(ctx, rawConfig) {
     const warnings = []
     const values = templateValues()
     if (writeIfChanged(paths.cli, render(template('dwd.sh'), values), 0o755)) changed.push('dwd')
+    // The tombstone server is shipped as-is: it takes its ports on the command
+    // line, so it needs no rendering.
+    if (writeIfChanged(paths.mover, template('mover.mjs'), 0o644)) changed.push('mover.mjs')
     const dir = cliDir()
     for (const name of ['dwd', 'dsh-wrainrock-daemon']) {
       const link = join(dir, name)
@@ -1441,6 +1678,10 @@ export function createManager(ctx, rawConfig) {
 
   async function uninstall({ purge = false } = {}) {
     const result = { ok: true, warnings: [], steps: [] }
+    // Tombstones are ours and hold ports: nothing else in this plugin can
+    // still be wanted once the daemon is going away.
+    const stopped = stopAllMovers('uninstall')
+    if (stopped > 0) result.steps.push({ step: 'stop-movers', count: stopped, ok: true })
     if (isManagedByUnit()) {
       result.warnings.push('this process is the running service; it keeps running until it exits or the unit is stopped')
     }
@@ -1889,6 +2130,11 @@ export function createManager(ctx, rawConfig) {
       appArgs: appArgs(),
       port: portState(),
       url: urlState(req),
+      mover: {
+        enabled: settings.moverOnPortChange === true,
+        previousPort: readLastPort()?.port ?? 0,
+        records: readMoverRecords(paths).map((record) => ({ from: record.from, pid: record.pid })),
+      },
       supervisor: supervisorState(),
       client: clientState(),
       clientHeartbeat: clientHeartbeat(),
@@ -1909,6 +2155,7 @@ export function createManager(ctx, rawConfig) {
         portGuard: settings.portGuard,
         enterMode: settings.enterMode,
         entryKeySet: resolvedEntryKey() !== '',
+        moverOnPortChange: settings.moverOnPortChange === true,
       },
     }
   }
@@ -2172,6 +2419,13 @@ export function createManager(ctx, rawConfig) {
     activated = true
     watchReadiness()
     writeRuntime()
+    // Before anything else that can fail: a browser still sitting on the port
+    // this process came from has nowhere else to go.
+    try {
+      syncMovers()
+    } catch (error) {
+      warn(`could not leave a redirect on the previous port: ${error?.message ?? error}`)
+    }
     if (!settings.installOnActivate) {
       info('activation: installOnActivate=false, only reporting status')
       return
@@ -2208,7 +2462,7 @@ export function createManager(ctx, rawConfig) {
     activated = false
   }
 
-  return { bindPort, activate, dispose, routes, status, install, uninstall, repair, selftest, planRestart, performRestart, clearSafeMode, setNextPort, portState, urlState, settings, paths }
+  return { bindPort, activate, dispose, routes, status, install, uninstall, repair, selftest, planRestart, performRestart, clearSafeMode, setNextPort, portState, urlState, syncMovers, settings, paths }
 }
 
 // ---------------------------------------------------------------------------
