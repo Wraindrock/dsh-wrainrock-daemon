@@ -135,6 +135,11 @@ try {
   check('enter status', 303, entered.status)
   check('enter location', '/', entered.headers.get('location'))
   check('enter cookie', COOKIE, entered.headers.getSetCookie()[0]?.split(';')[0])
+  // The bridge must forward the WHOLE cookie, attributes included: dropping
+  // `Path=/` scopes the cookie to the route's directory and the next request
+  // to `/` answers 401 (the 2026-11-07 source-built-DSH field failure).
+  check('enter cookie keeps Path=/', true, entered.headers.getSetCookie()[0]?.includes('Path=/'))
+  check('enter cookie keeps HttpOnly', true, entered.headers.getSetCookie()[0]?.includes('HttpOnly'))
   check('enter has no token in the location', false, String(entered.headers.get('location')).includes('token'))
 
   // 4. a proxied request is refused
@@ -170,6 +175,7 @@ try {
   const ok = await get(`/dsh-wrainrock-daemon/enter?k=${key}`)
   check('key mode with the right k', 303, ok.status)
   check('key mode sets the cookie', COOKIE, ok.headers.getSetCookie()[0]?.split(';')[0])
+  check('key mode cookie keeps Path=/', true, ok.headers.getSetCookie()[0]?.includes('Path=/'))
   await new Promise((resolve) => server.close(resolve))
 
   // 7. no connection service: the log is the fallback
@@ -246,6 +252,7 @@ try {
   const landed = await fetch(moved.headers.get('location'), { redirect: 'manual' })
   check('the entry logs the browser in', 303, landed.status)
   check('the entry sets a fresh cookie', COOKIE, landed.headers.getSetCookie()[0]?.split(';')[0])
+  check('the fresh cookie keeps Path=/', true, landed.headers.getSetCookie()[0]?.includes('Path=/'))
   const recorded = (await second.status()).mover.records
   check('the tombstone is recorded', `${portA}`, recorded.map((entry) => entry.from).join(','))
   check('the tombstone is a real process', true, recorded.every((entry) => entry.pid > 0))

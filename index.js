@@ -1168,9 +1168,16 @@ export function createManager(ctx, rawConfig) {
       }, (response) => {
         const raw = response.headers['set-cookie']
         const list = Array.isArray(raw) ? raw : raw === undefined ? [] : [String(raw)]
-        const cookie = list
-          .map((entry) => String(entry).split(';')[0])
-          .find((entry) => entry.startsWith('dsh-auth-') && entry.includes('='))
+        // Forward the WHOLE entry, not just name=value: the cookie the app
+        // mints carries `Path=/`, and without that attribute the browser scopes
+        // it to this route's directory (`/dsh-wrainrock-daemon`), so the next
+        // request to `/` would go out without it and answer 401 — exactly what
+        // the bridge exists to avoid.
+        const entry = list.find((candidate) => candidate.startsWith('dsh-auth-') && candidate.includes('='))
+        let cookie
+        if (entry !== undefined) {
+          cookie = /;\s*path\s*=/i.test(entry) ? entry : `${entry}; Path=/`
+        }
         response.resume()
         if (cookie === undefined) done({ ok: false, reason: `no-cookie-${String(response.statusCode)}`, target })
         else done({ ok: true, cookie, target })

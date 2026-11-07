@@ -520,7 +520,7 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 
 ### 升级
 
-每个发布版本都打 tag（当前 `v0.3.1`，与 `package.json` 的 `version` 一致）并发布为 GitHub Release。
+每个发布版本都打 tag（当前 `v0.3.2`，与 `package.json` 的 `version` 一致）并发布为 GitHub Release。
 升级有两条路：
 
 **1. 市场（dshmarket）里一键升级。** 对 `github:` spec 的安装，市场比较「默认分支 HEAD 上
@@ -541,7 +541,7 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 要钉住某个发布版本，把 tag 写在 spec 后面：
 
 ```bash
-dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.3.1
+dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.3.2
 ```
 
 两条路装完都要点一次界面上的「重启」（或等下次开机），运行中的实例才会换成新版。
