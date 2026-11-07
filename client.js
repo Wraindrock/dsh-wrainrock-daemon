@@ -69,6 +69,17 @@ window.__ModuleLoader__.load({
       portSaved: '已保存，下次启动生效',
       portSavedRestart: '已保存，服务即将重启；页面稍后需要刷新',
       portFailed: '保存失败',
+      // Settings → Daemon: the stable sign-in entry (the launch cookie is bound
+      // to host:port, so a port change invalidates the old cookie).
+      entryTitle: '登录入口',
+      entryIntro: '换端口后旧登录会失效；从这个入口打开会自动登录，建议收藏。',
+      entryAddress: '入口地址',
+      entryOpen: '打开 DeepSeek Harness',
+      entryCopy: '复制登录链接',
+      entryCopied: '已复制',
+      entryCopyFailed: '复制失败，请手动选中下面的链接',
+      entryHint: '端口变更后需重新从这个入口打开（登录 cookie 绑定 host:port）。',
+      entryUnavailable: '入口信息不可用',
       cloudflareLabel: '转发至 Cloudflare 域名',
       cloudflareBadge: '实验性·开发中',
       cloudflareHint: '占位功能：把本地服务转发到一个 Cloudflare 域名，目前尚未开放，暂时无法开启。',
@@ -106,6 +117,15 @@ window.__ModuleLoader__.load({
       portSaved: 'Saved — takes effect on the next start',
       portSavedRestart: 'Saved — the service is restarting; reload the page in a moment',
       portFailed: 'Save failed',
+      entryTitle: 'Sign-in entry',
+      entryIntro: 'Changing the port invalidates the old sign-in; open from this entry to sign in automatically, and bookmark it.',
+      entryAddress: 'Entry address',
+      entryOpen: 'Open DeepSeek Harness',
+      entryCopy: 'Copy sign-in link',
+      entryCopied: 'Copied',
+      entryCopyFailed: 'Copy failed — select the link below manually',
+      entryHint: 'After a port change, open from this entry again (the sign-in cookie is bound to host:port).',
+      entryUnavailable: 'Entry information unavailable',
       cloudflareLabel: 'Forward to a Cloudflare domain',
       cloudflareBadge: 'Experimental · in development',
       cloudflareHint: 'Placeholder: forward this local service to a Cloudflare domain. Not available yet and cannot be enabled for now.',
@@ -157,6 +177,10 @@ window.__ModuleLoader__.load({
   background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
 .dsa-input:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid
   var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
+/* Settings → Daemon: the sign-in entry stays readable AND selectable by hand. */
+.dsa-url{font-family:var(--dsw-font-family-mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);
+  font-size:12px;line-height:18px;word-break:break-all;user-select:text;
+  color:var(--dsw-alias-label-secondary)}
 .dsa-btn.dsa-primary{border-color:transparent;background:var(--dsw-alias-button-primary-fill);
   color:var(--dsw-alias-label-primary-foreground);font-weight:500}
 .dsa-btn.dsa-primary:hover:not([disabled]){background:var(--dsw-alias-button-primary-hover);
@@ -220,6 +244,42 @@ window.__ModuleLoader__.load({
         /* both routes are unavailable; the caller renders 不可用 */
       }
       return null
+    }
+
+    /**
+     * Sign-in entry for Settings → Daemon. `GET /url` answers with the plain UI
+     * address, the authenticated link for this process and a stable `entry` that
+     * re-issues the launch cookie. Returns null on a non-2xx answer, a malformed
+     * body or a missing route — the section then renders 不可用 instead of
+     * breaking the panel.
+     */
+    async function readEntryInfo() {
+      try {
+        const response = await fetch(`${BASE}/url`, { cache: 'no-store' })
+        if (!response.ok) return null
+        const data = await response.json()
+        if (!data || typeof data !== 'object' || data.ok === false) return null
+        return data
+      } catch {
+        return null
+      }
+    }
+
+    /** Trimmed non-empty string from a route field; anything else reads as null. */
+    function textOf(value) {
+      if (typeof value !== 'string') return null
+      const text = value.trim()
+      return text === '' ? null : text
+    }
+
+    /** URL the 打开 button uses: the stable entry first, then the plain UI address. */
+    function entryTarget(info) {
+      return textOf(info?.entry) ?? textOf(info?.current)
+    }
+
+    /** URL 复制 uses: the authenticated link when the host has one, else the entry. */
+    function copyTarget(info) {
+      return textOf(info?.authenticated) ?? entryTarget(info)
     }
 
     /** Client-side range check (integer 1..65535); null means "not a valid port". */
@@ -654,6 +714,10 @@ window.__ModuleLoader__.load({
               className: noteClass, 'data-dsa-note': note.kind, role: 'status',
             }, note.text) : null,
             !ready ? h('p', { className: 'dsa-hint' }, t('portLoading')) : null)),
+        // The sign-in entry sits right after the port card: it is the answer to
+        // "the port changed and my old cookie died". Its own boundary keeps a
+        // crash here from taking the port card down with it.
+        h(SafeBoundary, { fallback: null }, h(EntrySection, { t })),
         h('div', { className: 'dsa-card' },
           h('div', {
             className: 'dsa-row dsa-disabled',
@@ -664,6 +728,101 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsa-rowLabel' }, t('cloudflareLabel')),
           h('span', { className: 'dsa-badge' }, t('cloudflareBadge'))),
           h('p', { className: 'dsa-hint' }, t('cloudflareHint'))))
+    }
+
+    /**
+     * Settings → Daemon: the stable sign-in entry. The launch cookie is bound to
+     * host:port, so a plain URL stops authenticating after a port change; opening
+     * this entry once re-issues the cookie. Every fetch and click degrades
+     * quietly (unavailable hint, selectable text) instead of throwing.
+     */
+    function EntrySection(props) {
+      const t = props.t
+      const [info, setInfo] = React.useState(null)
+      const [ready, setReady] = React.useState(false)
+      const [note, setNote] = React.useState(null)
+      const [reveal, setReveal] = React.useState(null)
+      const live = typeof React.useRef === 'function' ? React.useRef(true) : { current: true }
+
+      React.useEffect(() => {
+        live.current = true
+        readEntryInfo().then((next) => {
+          if (!live.current) return
+          setInfo(next)
+          setReady(true)
+        }).catch(() => {
+          if (!live.current) return
+          setInfo(null)
+          setReady(true)
+        })
+        return () => { live.current = false }
+        // Runs once per mount: the section is remounted whenever it is opened.
+      }, [])
+
+      const open = () => {
+        const url = entryTarget(info)
+        if (!url) return
+        try {
+          window.open(url, '_blank', 'noopener')
+        } catch {
+          setNote({ kind: 'error', text: t('entryUnavailable') })
+        }
+      }
+
+      const copy = () => {
+        const url = copyTarget(info)
+        if (!url) return
+        const clipboard = typeof navigator === 'object' && navigator ? navigator.clipboard : null
+        let request = null
+        try {
+          if (clipboard && typeof clipboard.writeText === 'function') request = clipboard.writeText(url)
+        } catch {
+          request = null
+        }
+        // No clipboard API (or a synchronous throw): reveal the link instead, so
+        // the user can still copy it by hand.
+        if (!request || typeof request.then !== 'function') {
+          setReveal(url)
+          setNote({ kind: 'error', text: t('entryCopyFailed') })
+          return
+        }
+        request.then(() => {
+          if (!live.current) return
+          setReveal(null)
+          setNote({ kind: 'ok', text: t('entryCopied') })
+        }).catch(() => {
+          if (!live.current) return
+          setReveal(url)
+          setNote({ kind: 'error', text: t('entryCopyFailed') })
+        })
+      }
+
+      const entry = info ? textOf(info.entry) : null
+      const openable = entryTarget(info)
+      const noteClass = note?.kind === 'ok' ? 'dsa-okText' : 'dsa-errText'
+
+      return h('div', {
+        className: 'dsa-card',
+        'data-dsa-entry': info ? String(info.mode ?? 'unknown') : (ready ? 'unavailable' : 'loading'),
+      },
+        h('div', { className: 'dsa-field' },
+          h('span', { className: 'dsa-label' }, t('entryTitle')),
+          h('p', { className: 'dsa-hint' }, t('entryIntro')),
+          !ready ? h('p', { className: 'dsa-hint' }, t('portLoading')) : null,
+          ready && !openable ? h('p', { className: 'dsa-hint dsa-warnText' }, t('entryUnavailable')) : null),
+        entry ? h('div', { className: 'dsa-field' },
+          h('span', { className: 'dsa-label' }, t('entryAddress')),
+          h('code', { className: 'dsa-url', 'data-dsa-entry-url': entry }, entry),
+          h('p', { className: 'dsa-hint' }, t('entryHint'))) : null,
+        openable ? h('div', { className: 'dsa-inline' },
+          h('button', {
+            type: 'button', className: 'dsa-btn dsa-primary', onClick: open,
+          }, t('entryOpen')),
+          h('button', { type: 'button', className: 'dsa-btn', onClick: copy }, t('entryCopy'))) : null,
+        reveal ? h('code', { className: 'dsa-url', 'data-dsa-entry-reveal': '1' }, reveal) : null,
+        note ? h('p', {
+          className: noteClass, 'data-dsa-entry-note': note.kind, role: 'status',
+        }, note.text) : null)
     }
 
     /** Last-resort settings page: a crash must not blank the panel entry. */
@@ -764,7 +923,7 @@ window.__ModuleLoader__.load({
       },
       // Test seam: the restart lifecycle is the part that must not regress and
       // the part a browser cannot be driven into reproducing here.
-      __test: { createRestartFlow, decideAfterPoll, recoveryIds, fillIds, parsePortInput, portSourceKey, portQuery, readPortSnapshot },
+      __test: { createRestartFlow, decideAfterPoll, recoveryIds, fillIds, parsePortInput, portSourceKey, portQuery, readPortSnapshot, readEntryInfo, entryTarget, copyTarget },
     }
   },
 })

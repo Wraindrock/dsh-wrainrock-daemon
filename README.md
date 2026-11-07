@@ -60,6 +60,8 @@
 - **状态与日志接口**（仅本机可访问，写操作需带 `x-dsh-wrainrock-daemon: 1` 头）：
 
   ```
+  GET  /dsh-wrainrock-daemon/url          # {ok,current,authenticated,entry,mode,port}：令牌链接与稳定入口
+  GET  /dsh-wrainrock-daemon/enter        # 稳定入口：服务端完成 token→cookie 交换后 303 到 ./
   GET  /dsh-wrainrock-daemon/status       # systemd / 看护 / 事故 / 路径 全量状态
   GET  /dsh-wrainrock-daemon/log?lines=200&source=dsh
   GET  /dsh-wrainrock-daemon/port         # 端口快照（同 status.port：current/source/next/nextSafe/override/pending）
@@ -98,6 +100,8 @@ dwd rp 3081                # 把「下次启动端口」设为 3081（别名：d
 dwd rp 3081 --no-restart   # 只改「下次启动端口」，现在不重启
 dwd rp 3081 --safe-port 3099   # 顺带指定下次启动的安全模式端口
 dwd restart                # 现在就重启（同面板「重启」按钮）
+dwd url [--open]           # 打印/打开当前带 token 的登录链接（过渡与备用）
+dwd enter [--open]         # 打印/打开稳定入口 /dsh-wrainrock-daemon/enter
 dwd help                   # 用法
 ```
 
@@ -124,6 +128,7 @@ echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc   # bash 用 ~/.bashrc
 ~/.dsh/wrainrock-daemon/state/                               # mode / failures / last_exit / incident.json
 ~/.dsh/wrainrock-daemon/state/port.json                      # 「下次启动端口」唯一事实来源：{port, safePort, at, by}
 ~/.dsh/wrainrock-daemon/state/runtime.json                   # 当前运行实例：{pid, port, safePort, unit, profile, at}
+~/.dsh/wrainrock-daemon/state/entry.json                     # key 模式的入口密钥：{key, at}（缺失/非法则入口拒绝 key 请求）
 ~/.dsh/wrainrock-daemon/state/supervisor-<profile>-<port>.lock   # 看护单例锁（flock，进程退出即释放）
 ~/.dsh/wrainrock-daemon/backup/                              # 最近一次能正常组合的 profile 配置快照
 ~/.dsh/wrainrock-daemon/reports/                             # 事故报告（incident-*.md、latest.md、broken-*/）
@@ -136,6 +141,8 @@ echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc   # bash 用 ~/.bashrc
 systemctl --user status dsh-wrainrock-daemon.service
 grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.out.log | tail -1
 ```
+
+不想翻日志就用 `dwd url`（当前令牌链接）或 `dwd enter`（稳定入口）——两者的区别见「登录与入口」一节。
 
 ## 端口状态（state/port.json / state/runtime.json）
 
@@ -158,6 +165,52 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.
   而临时 `DSH_WRAINROCK_DAEMON_PORT=… systemctl --user restart …` 又能压过两者（安全模式同理走 `safePort`）。
 - 安全模式端口同样按这套优先级取 `safePort`；`state/port.json` 里没写安全端口时默认取「下次启动端口 + 1」。
 
+## 登录与入口：为什么裸端口打不开
+
+直接访问 `http://127.0.0.1:3080/` 会拿到 `401 dsh web authentication required; reopen the URL printed by dsh web.`
+——这不是故障，而是 DSH 网页端**有意为之**的鉴权：GUI 只认「带 token 的地址」或「此前交换来的 cookie」。
+理解这两步，才能理解为什么需要一个**稳定入口**。
+
+机制分两步：
+
+1. **每进程一个 launch token**：`dsh web` 每次启动都随机生成 32 字节、base64url 编码的 token，只印在启动日志里
+   （`dsh web: http://127.0.0.1:<port>/?token=<token>`）。它**重启即换**，不落盘，所以没法长期收藏。
+2. **一次 token → cookie 交换**：`GET /?token=<token>`（路径恰为 `/`、只带这一个 token 参数）会回 `303` 跳到 `./`，
+   并 `Set-Cookie: dsh-auth-<base64url(sha256(host:port))>=v1…`；cookie 为 `HttpOnly` / `SameSite=Strict` / `Path=/`，
+   默认 30 天（`cookieMaxAgeDays`）。签名密钥持久化在 credentials 记录 `client-connection/browser-session` 里，
+   所以**重启不会失效**；但 **cookie 名绑定 authority**（`host:port`），**换端口即失效**，得重新走一次 token 交换。
+
+本机实测（`127.0.0.1:3080`）：
+
+| 请求 | 结果 |
+| --- | --- |
+| 裸 URL `GET /`（无 cookie、无 token） | `401 dsh web authentication required; reopen the URL printed by dsh web.` |
+| `GET /?token=<正确 token>` | `303` → `./`，`Set-Cookie: dsh-auth-VPhEEcL…; Max-Age=2592000` |
+| 带该 cookie `GET /` | `200` |
+| `GET /?token=<错误 token>` | `401` |
+
+**关键前提**：登录凭据绑在 `host:port` 上，而 token 每次重启都换 —— 所以「收藏带 token 的地址」和
+「收藏裸端口」都留不住。daemon 因此提供**稳定入口** `GET /dsh-wrainrock-daemon/enter`：由服务端自己完成上面那次
+token 交换（取回当前进程的 token 链接、把 `Set-Cookie` 透传给浏览器）再 `303` 到 `./`。
+浏览器地址栏里**不出现 token**，可以长期收藏；换端口时只改 URL 里的端口这一个数字，cookie 由入口自动续上。
+另有 `GET /dsh-wrainrock-daemon/url` 回 `{ok:true, current, authenticated|null, entry, mode, port}`
+（`current` 是当前带 token 链接，`entry` 是稳定入口，`authenticated` 是「本次请求是否已带有效 cookie」）。
+
+命令行两条路：
+
+```bash
+dwd url                    # 打印当前带 token 的登录链接（过渡与备用；重启后作废）
+dwd url --open             # 直接打开它
+dwd enter                  # 打印稳定入口 http://127.0.0.1:3080/dsh-wrainrock-daemon/enter
+dwd enter --open           # 直接打开稳定入口
+```
+
+入口的放行策略由配置 `enterMode` 决定（默认 `loopback`）：`loopback` 只服务直连回环、且不带
+`x-forwarded-for` / `cf-connecting-ip` / `x-real-ip` / `forwarded` 任一转发头的请求；
+`key` 模式额外要求 URL 查询参数 `k` 等于密钥（密钥来自 `state/entry.json`，入口 URL 形如 `…/enter?k=…`）；
+`open` 模式不做来源限制（**只在已有别的访问控制时才用**，例如 Cloudflare Access）。
+被拒绝时回 `403`。把它转发到公网域名的思路见下文「转发到域名（实验性）的思路」。
+
 ## 设置 → Daemon 页
 
 面板的 **设置 → Daemon** 页把端口收在一处：
@@ -174,6 +227,18 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.
 **「转发至 Cloudflare 域名」是实验性·开发中，目前只是一个占位行：不可点击，也不做任何事**——
 不会建隧道、不改配置、不联网。它只是先把「把本机 GUI 暴露到某个 Cloudflare 域名」这个方向摆在设置页上，
 等真正实现后才可用；现在请勿据此排查连通性问题。
+
+### 转发到域名（实验性）的思路
+
+方向是清楚的，实现时要顺着「登录与入口」那套机制走：
+
+1. 用 cloudflared 隧道把本机端口暴露出去（`cloudflared tunnel --url http://127.0.0.1:<port>`），
+   并把公开地址设成域名：`--public-url https://<域名>`（连同 `--trusted-host <域名>` 一起写进 `extraAppArgs`，
+   否则 DSH 的 Host/Origin 校验会拒掉带域名的请求），让 daemon 打印的链接与入口都以它为准；
+2. 入口 URL 随之变成 `https://<域名>/dsh-wrainrock-daemon/enter`；
+3. **但隧道的请求一定带 `CF-Connecting-IP` / `X-Forwarded-For`**，所以默认的 `enterMode: 'loopback'` 会一律拒绝 ——
+   必须改成 `enterMode: 'key'`（入口 URL 带 `?k=…`），或者 `enterMode: 'open'` 并**同时**在外层套 Cloudflare Access；
+4. 别忘了 cookie 会绑定**公网 authority**：换域名、换端口都会让已交换的 cookie 失效，需要重新走一次入口。
 
 ## 恢复阶梯
 
@@ -193,7 +258,12 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.
 
 `unitName`、`safeUnitName`、`safeProfile`、`safeTemplate`、`failureThreshold`、`failureWindowSeconds`、
 `healthySeconds`、`maxBackoffSeconds`、`port`、`safePort`、`portGuard`、`host`、`extraAppArgs`、`cliPath`、`nodeBin`、
-`cliDir`、`homeDir`、`unitDir`、`installOnActivate`、`containerOnly`、`startAtBoot`、`enableLinger`、`notify`。
+`cliDir`、`homeDir`、`unitDir`、`installOnActivate`、`containerOnly`、`startAtBoot`、`enableLinger`、`notify`、
+`enterMode`、`entryKey`。
+
+`enterMode` 控制稳定入口 `GET /enter` 的放行策略：`loopback`（默认，只服务直连回环且无转发头）、
+`key`（额外要求 `?k=` 等于入口密钥）、`open`（不限制来源，仅在另有访问控制时使用）。`entryKey` 是 key 模式
+使用的密钥，留空/非法时以 `state/entry.json` 里那份随机密钥为准（见「登录与入口」一节）。
 
 `cliDir`（默认 `$HOME/bin`）是放置 `dwd` / `dsh-wrainrock-daemon` 两个软链接的目录，改它不会移动
 `<homeDir>/bin/dwd` 本体，只换链接位置。
@@ -226,8 +296,13 @@ bash tests/ladder.sh
 **从已安装布局自动修复 node/dsh 路径**、**收到 stop 信号立刻退出**、
 **改名迁移（两代旧名）**、**同伴端口等待 / 锁待命 / 端口竞争不计失败 / 安全模式独立端口**、
 **停掉一个看护会停掉另一个管理器的同伴**、**systemd-kill helper 会停掉所有看护并重新拉起 unit**。
-不触碰真实 profile 与真实 unit。另有 `node tests/restart-plan.mjs`（重启决策）、`node tests/migration.mjs`（改名迁移）
-与 `node tests/port-state.mjs`（端口取值解析、`state/port.json` 覆盖文件的读取、端口快照 `current/next/pending/source` 优先级）。
+不触碰真实 profile 与真实 unit。另有 `node tests/restart-plan.mjs`（重启决策）、`node tests/migration.mjs`（改名迁移）、
+`node tests/port-state.mjs`（端口取值解析、`state/port.json` 覆盖文件的读取、端口快照 `current/next/pending/source` 优先级）
+与 `node tests/entry-state.mjs`（登录入口纯函数：`peerIsDirectLoopback` 的回环/转发头判定、`entryGate` 三种 mode、
+`buildEntryUrl` 的拼法、`entryKeyOf` 对 `state/entry.json` 的读取），
+以及 `node tests/entry-flow.mjs`（登录入口端到端：伪造的 `dsh web` 鉴权面与守护进程自己的路由跑在同一个端口上，
+验证裸路径 401、`/url` 的三个地址、`/enter` 的 `303` + 真实 `Set-Cookie`、经代理时 403、`enterMode=key` 的密钥校验、
+拿不到 cookie 时回退 `302`，最后真装一份 `dwd` 跑 `url` / `enter` / `status`）。
 
 ## 修复记录
 
@@ -349,7 +424,11 @@ systemctl --user show dsh-wrainrock-daemon.service -p MainPID --value   # 应等
   「停掉一个看护会停掉同伴」「systemd-kill helper 重新拉起 unit」四组新断言）
   + 重启决策测试（`node tests/restart-plan.mjs`）+ 改名迁移测试（`node tests/migration.mjs`，对 `dsh-ian-daemon` 与 `dsh-autostart` 两代旧名各跑一遍）
   + 端口状态测试（`node tests/port-state.mjs`：解析 `0`/`65536`/`-1`/`'abc'`/`''`/`null`/`3080`/`'3080'`/`' 3080 '`/`'3080.5'`，
-    `state/port.json` 缺失/合法/坏 JSON/越界/`safePort:null`，以及快照 `live > override > config` 的优先级与 `pending` 判定）；
+    `state/port.json` 缺失/合法/坏 JSON/越界/`safePort:null`，以及快照 `live > override > config` 的优先级与 `pending` 判定）
+  + 登录入口测试（`node tests/entry-state.mjs`：回环 peer 与各转发头、三种 `enterMode`、入口 URL 拼接与 `state/entry.json` 读取）
+  + 登录入口端到端测试（`node tests/entry-flow.mjs`），并对着**本机真实运行的 3080 实例**验证过：
+    `GET /dsh-wrainrock-daemon/enter` → `303 location: /`，拿到的 `dsh-auth-…` cookie 名正好等于
+    `b64url(sha256(浏览器看到的 authority))`（即端口/域名换了就得重新从入口进）；token 不对时回退 `302` 到带 token 的地址；
 - 用与 `ExecStart` 完全相同的命令行真实启动过 Harness；
 - **真实重启电脑后自动起来**（开机 15 秒内拉起，无需登录），关机时看护脚本干净退出；
 - 手动「重启」按钮点击后成功由 systemd 接管；
@@ -371,7 +450,7 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 
 ### 升级
 
-每个发布版本都打 tag（当前 `v0.2.1`，与 `package.json` 的 `version` 一致）并发布为 GitHub Release。
+每个发布版本都打 tag（当前 `v0.3.0`，与 `package.json` 的 `version` 一致）并发布为 GitHub Release。
 升级有两条路：
 
 **1. 市场（dshmarket）里一键升级。** 对 `github:` spec 的安装，市场比较「默认分支 HEAD 上
@@ -392,7 +471,7 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 要钉住某个发布版本，把 tag 写在 spec 后面：
 
 ```bash
-dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.2.1
+dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.3.0
 ```
 
 两条路装完都要点一次界面上的「重启」（或等下次开机），运行中的实例才会换成新版。
@@ -407,7 +486,8 @@ MIT © 2026 Grant-Felix — 见 [LICENSE](LICENSE)。
 
 ## 已知边界
 
-- 服务绑定默认回环地址；`dsh web` 的 GUI 需要带 token 的 URL，见上文日志取法。
+- 服务绑定默认回环地址；`dsh web` 的 GUI 需要带 token 的 URL，见上文日志取法；日常请用稳定入口
+  `GET /dsh-wrainrock-daemon/enter`（`dwd enter`），见「登录与入口」一节。
 - 同一账号上有多个 systemd 用户管理器时，unit 会被启动多份：看护用单例锁+同伴端口识别把服务收敛成一份，
   停/启/重启也不会再是空操作（见 2026-10-17 修复记录）；但管理器本身是环境问题，本项目不清、也不该清。
 - 服务在开机时若端口被**非本项目的**进程占用，仍会按快速失败计数升级到安全模式（此时安全模式用 `safePort` 启动，依然可用）；若占用者是**本项目的另一个实例**，则认定成同伴、等待它退出，绝不会因此升级。

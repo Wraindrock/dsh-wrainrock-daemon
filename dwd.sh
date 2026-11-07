@@ -10,6 +10,10 @@
 #   dwd rp <port> --no-restart only record it; the next start picks it up
 #   dwd rp <port> --safe-port <port>
 #   dwd status                 what serves now, and what the next start uses
+#   dwd url [--open]           the token-bearing login URL of the running
+#                              process (short-lived: it changes on every start)
+#   dwd enter [--open]         the STABLE login entry — open it once and the
+#                              daemon logs the browser in; safe to bookmark
 #   dwd restart                restart the daemon
 #   dwd help
 #
@@ -30,6 +34,7 @@ PROFILE="${DSH_WRAINROCK_DAEMON_PROFILE:-@@PROFILE@@}"
 STATE_DIR="${DSH_WRAINROCK_DAEMON_STATE:-${HOME_DIR}/state}"
 RUNTIME_FILE="${STATE_DIR}/runtime.json"
 PORT_FILE="${STATE_DIR}/port.json"
+LOG_FILE="${DSH_WRAINROCK_DAEMON_LOG:-${HOME_DIR}/logs/dsh.out.log}"
 ROUTE_PREFIX="${DSH_WRAINROCK_DAEMON_ROUTE:-/dsh-wrainrock-daemon}"
 TIMEOUT="${DSH_WRAINROCK_DAEMON_TIMEOUT:-5}"
 
@@ -45,6 +50,8 @@ usage() {
   say "  dwd rp <端口> --no-restart        只写入设置，不重启"
   say "  dwd rp <端口> --safe-port <端口>  同时指定安全模式端口"
   say "  dwd status                        查看当前端口与下次启动端口"
+  say "  dwd url [--open]                  打印当前登录链接（带 token，随重启更换）"
+  say "  dwd enter [--open]                打印稳定登录入口（可长期收藏）"
   say "  dwd restart                       立即重启守护进程"
   say "  dwd help                          显示本帮助"
   say ""
@@ -68,6 +75,13 @@ json_bool() { # <key>; JSON on stdin
 json_number() { # <file> <key>
   [ -r "$1" ] || return 1
   json_field "$2" < "$1"
+}
+
+# A string field. The values this reads are URLs, which never contain a quote or
+# a backslash, so a plain `grep -o` paired with `sed` is enough.
+json_text() { # <key>; JSON on stdin
+  grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null \
+    | head -n1 | sed 's/^[^:]*:[[:space:]]*"//; s/"$//'
 }
 
 port_valid() { # <value>
@@ -224,6 +238,88 @@ cmd_status() {
 
 cmd_restart() { do_restart; }
 
+# --- login links -------------------------------------------------------------
+
+# Open a URL in whatever browser this box has. This machine has no xdg-open
+# (distrobox), so every common opener is tried before giving up: printing the
+# URL is still a useful answer.
+open_url() { # <url>
+  local url="$1"
+  if command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 && return 0; fi
+  if command -v gio >/dev/null 2>&1; then gio open "$url" >/dev/null 2>&1 && return 0; fi
+  if command -v open >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 && return 0; fi
+  if command -v wslview >/dev/null 2>&1; then wslview "$url" >/dev/null 2>&1 && return 0; fi
+  if command -v python3 >/dev/null 2>&1; then python3 -m webbrowser "$url" >/dev/null 2>&1 && return 0; fi
+  warn "没有找到可用的浏览器打开命令，请手动打开上面的链接。"
+  return 1
+}
+
+# The token URL the child printed on its way up, for when the daemon cannot
+# answer: the supervisor redirects the child's stdout into our own log.
+token_url_from_log() {
+  local port
+  [ -r "$LOG_FILE" ] || return 0
+  port="$(live_port)"
+  [ -n "$port" ] || return 0
+  tail -n 400 "$LOG_FILE" 2>/dev/null \
+    | grep -o 'dsh web:[[:space:]]*https\?://[^[:space:]]*token=[A-Za-z0-9_-]*' \
+    | tail -n1 \
+    | sed 's/.*token=/token=/' \
+    | sed "s|^|http://127.0.0.1:${port}/?|"
+}
+
+# The URL the running process would print: it carries the per-process token, so
+# it is the one that changes on every restart.
+cmd_url() {
+  local open=0 url='' body=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --open|-o) open=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "未知参数：$1（运行 dwd help 查看用法）" ;;
+      *) die "多余参数：$1" ;;
+    esac
+    shift
+  done
+
+  body="$(http_request GET '/url')"
+  if [ -n "$body" ]; then
+    url="$(printf '%s\n' "$body" | json_text authenticated)"
+    [ -n "$url" ] || url="$(printf '%s\n' "$body" | json_text entry)"
+  fi
+  [ -n "$url" ] || url="$(token_url_from_log)"
+  [ -n "$url" ] || die "拿不到登录链接：守护进程没有响应，日志里也没有 dsh web 记录。"
+
+  say "$url"
+  if [ "$open" = 1 ]; then open_url "$url" || true; fi
+}
+
+# The stable entry: it logs the browser in server-side, so the address bar keeps
+# a URL without a token and the bookmark survives a restart.
+cmd_enter() {
+  local open=0 entry='' body='' port=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --open|-o) open=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "未知参数：$1（运行 dwd help 查看用法）" ;;
+      *) die "多余参数：$1" ;;
+    esac
+    shift
+  done
+
+  body="$(http_request GET '/url')"
+  [ -n "$body" ] && entry="$(printf '%s\n' "$body" | json_text entry)"
+  if [ -z "$entry" ]; then
+    port="$(live_port)"
+    [ -n "$port" ] || die "未知端口：守护进程没有响应，也没有运行时记录。"
+    entry="http://127.0.0.1:${port}${ROUTE_PREFIX}/enter"
+  fi
+
+  say "$entry"
+  if [ "$open" = 1 ]; then open_url "$entry" || true; fi
+}
+
 # --- dispatch ----------------------------------------------------------------
 
 command="${1:-help}"
@@ -231,6 +327,8 @@ shift 2>/dev/null || true
 case "$command" in
   rp|report|port) cmd_rp "$@" ;;
   status|st) cmd_status ;;
+  url|login) cmd_url "$@" ;;
+  enter|open) cmd_enter "$@" ;;
   restart|rs) cmd_restart ;;
   help|-h|--help) usage ;;
   *) warn "未知命令：${command}"; usage >&2; exit 2 ;;

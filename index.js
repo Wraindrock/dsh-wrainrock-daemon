@@ -29,12 +29,18 @@
  *   POST reset       clear safe mode (+ optional restart)
  *   POST selftest    prove this session can start/stop a systemd unit
  *   GET  log         text tail of the supervisor log
+ *   GET  port        the live port and the requested next-start port
+ *   POST port        request the next-start port (optionally restart now)
+ *   GET  url         the authenticated url and the stable entry url
+ *   GET  enter       exchange this process's token for a cookie, then land on /
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, readlinkSync, lstatSync, unlinkSync, copyFileSync, cpSync, renameSync, statSync, openSync, readSync, closeSync, chmodSync, realpathSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir, userInfo } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
+import { request as httpRequest } from 'node:http'
+import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
@@ -224,6 +230,112 @@ export function portSnapshot({ livePort = 0, port = 0, safePort = 0, override = 
     requestedAt: override?.at,
     requestedBy: override?.by,
   }
+}
+
+// ---------------------------------------------------------------------------
+// browser entry: a stable URL that logs the browser in
+// ---------------------------------------------------------------------------
+
+/**
+ * Why this exists.
+ *
+ * The web surface authenticates a browser once, with a token minted per process
+ * and exchanged for a cookie whose NAME is derived from the authority
+ * (host:port). Two consequences follow, and both are visible to a user:
+ *
+ *  - the URL `dsh web` prints cannot be bookmarked across a restart, because a
+ *    new process means a new token;
+ *  - after a port change the old cookie is dead, so the plain origin answers
+ *    401 until the user finds a token URL again.
+ *
+ * So the daemon publishes one stable URL of its own — `GET <prefix>/enter` —
+ * and performs the token exchange server-side: it asks the local listener for a
+ * fresh token URL, keeps the cookie, and hands it to the browser. The address
+ * bar then holds a URL with no token in it that only changes when the port does.
+ *
+ * That route is the one place where a proxied request must not be trusted by
+ * default, hence `enterMode`:
+ *   loopback  answer only requests that arrived directly on the loopback socket
+ *   key       also require `?k=<entryKey>` — what a tunnel needs
+ *   open      no check at all (put Cloudflare Access, or a private network, in front)
+ */
+
+/** A key only counts when it is long and made of URL-safe characters. */
+const ENTRY_KEY_PATTERN = /^[A-Za-z0-9_-]{16,}$/
+
+/** Headers that betray a proxy or tunnel even when the socket itself is local. */
+const FORWARDED_HEADERS = ['x-forwarded-for', 'x-real-ip', 'cf-connecting-ip', 'forwarded']
+
+/** Where the generated entry key lives. */
+export function entryStatePath(paths) {
+  return join(paths.stateDir, 'entry.json')
+}
+
+/** A fresh entry key: 32 random bytes, base64url. */
+function newEntryKey() {
+  return randomBytes(32).toString('base64url')
+}
+
+/**
+ * The stored entry key, or '' when there is none.
+ *
+ * The value is re-validated on read: a hand-edited file must not be able to
+ * smuggle anything into a URL this plugin prints or serves.
+ */
+export function entryKeyOf(paths, options = {}) {
+  const file = options.file ?? entryStatePath(paths)
+  const raw = readText(file)
+  if (raw === undefined || raw === '') return ''
+  let record
+  try { record = JSON.parse(raw) } catch { return '' }
+  if (record === null || typeof record !== 'object') return ''
+  const key = typeof record.key === 'string' ? record.key : ''
+  return ENTRY_KEY_PATTERN.test(key) ? key : ''
+}
+
+/** True when the request arrived straight from this machine, with no proxy talk. */
+export function peerIsDirectLoopback(req) {
+  const address = typeof req?.socket?.remoteAddress === 'string' ? req.socket.remoteAddress : ''
+  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
+  const headers = req?.headers ?? {}
+  for (const name of FORWARDED_HEADERS) {
+    const value = headers[name]
+    if (value !== undefined && String(value).trim() !== '') return false
+  }
+  return true
+}
+
+/**
+ * Decide whether a request may use the entry route.
+ *
+ * `req` may be left out by an internal caller (a test, the CLI's own path):
+ * only the HTTP surface has a socket to judge, so the caller opts out of the
+ * peer check by not passing one.
+ */
+export function entryGate({ mode = 'loopback', key = '', req, url } = {}) {
+  const normalized = mode === 'key' || mode === 'open' ? mode : 'loopback'
+  if (normalized === 'open') return { ok: true, mode: normalized }
+  if (normalized === 'key') {
+    if (key === '') return { ok: false, mode: normalized, status: 403, reason: 'key-missing' }
+    const match = /[?&]k=([^&#]*)/.exec(String(url ?? req?.url ?? ''))
+    let given = ''
+    if (match !== null) {
+      try { given = decodeURIComponent(match[1]) } catch { given = match[1] }
+    }
+    if (given !== key) return { ok: false, mode: normalized, status: 403, reason: 'key-invalid' }
+    return { ok: true, mode: normalized }
+  }
+  if (!peerIsDirectLoopback(req)) return { ok: false, mode: normalized, status: 403, reason: 'not-loopback' }
+  return { ok: true, mode: normalized }
+}
+
+/** The stable entry URL — with `?k=` when the key mode is in force. */
+export function buildEntryUrl(origin, { mode = 'loopback', key = '', prefix = ROUTE_PREFIX } = {}) {
+  const base = String(origin ?? '').replace(/\/+$/, '')
+  const path = `${String(prefix ?? '').replace(/\/+$/, '')}/enter`
+  const url = `${base}${path}`
+  if (mode !== 'key' || key === '') return url
+  return `${url}?k=${encodeURIComponent(key)}`
 }
 
 /** Replace `@@TOKEN@@` placeholders in a shipped template. */
@@ -511,6 +623,15 @@ export function createManager(ctx, rawConfig) {
     // is first on PATH on the machines this was built for; an explicit empty
     // value falls back to it, and a symlink is never written over a real file.
     cliDir: expandHome(asString(config.cliDir, ''), home),
+    // Who may use the stable entry route (GET <prefix>/enter): "loopback"
+    // answers only a direct local request, "key" additionally requires
+    // ?k=<entryKey> and is what a tunnel needs, "open" drops both checks.
+    enterMode: (() => {
+      const value = asString(config.enterMode, 'loopback')
+      return value === 'key' || value === 'open' ? value : 'loopback'
+    })(),
+    // Explicit key; when empty, key mode generates one into state/entry.json.
+    entryKey: asString(config.entryKey, ''),
     // Names this project used before it was called dsh-wrainrock-daemon. An
     // install made under any of them migrates itself on the first install()
     // (see migrateLegacy), so upgrading machines need no manual step.
@@ -539,6 +660,7 @@ export function createManager(ctx, rawConfig) {
     supervisor: join(homeDir, 'bin', 'supervisor.sh'),
     relaunch: join(homeDir, 'bin', 'relaunch.sh'),
     cli: join(homeDir, 'bin', 'dwd'),
+    entry: join(homeDir, 'state', 'entry.json'),
     stateDir: join(homeDir, 'state'),
     reportDir: join(homeDir, 'reports'),
     logDir: join(homeDir, 'logs'),
@@ -670,6 +792,196 @@ export function createManager(ctx, rawConfig) {
       }
       writeFileSync(join(paths.stateDir, 'runtime.json'), `${JSON.stringify(record, null, 2)}\n`, 'utf8')
     } catch { /* the CLI falls back to systemd when this is missing */ }
+  }
+
+  // --- browser entry ---------------------------------------------------------
+
+  /** The entry key in force: the config value first, then state/entry.json. */
+  function resolvedEntryKey() {
+    return settings.entryKey !== '' ? settings.entryKey : entryKeyOf(paths)
+  }
+
+  /**
+   * Make sure a key exists while the key mode is on.
+   *
+   * Generated once and then kept, because it is part of a URL people bookmark:
+   * a key that changed on every startup would make the bookmark useless.
+   */
+  function ensureEntryKey() {
+    if (settings.entryKey !== '') return settings.entryKey
+    const existing = entryKeyOf(paths)
+    if (existing !== '') return existing
+    const key = newEntryKey()
+    try {
+      ensureDir(paths.stateDir)
+      writeIfChanged(paths.entry, `${JSON.stringify({ key, at: new Date().toISOString() }, null, 2)}\n`, 0o600)
+    } catch (error) {
+      warn(`could not store an entry key in ${paths.entry}: ${error?.message ?? error}`)
+      return ''
+    }
+    return key
+  }
+
+  /**
+   * The origin a browser should use: the advertised one when the app publishes
+   * it (that is where `publicUrl` shows up), else the bound listener, else the
+   * live port.
+   */
+  function runtimeOrigin() {
+    const app = typeof ctx.get === 'function' ? ctx.get('webApp') : undefined
+    if (app !== undefined && app !== null && typeof app.getAdvertisedUrl === 'function') {
+      try {
+        const advertised = app.getAdvertisedUrl()
+        if (typeof advertised === 'string' && advertised !== '') return advertised.replace(/\/+$/, '')
+      } catch { /* fall through to the bound origin */ }
+    }
+    const server = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined
+    if (server !== undefined && server !== null && typeof server.getOrigin === 'function') {
+      try {
+        const origin = server.getOrigin()
+        if (typeof origin === 'string' && origin !== '') return origin.replace(/\/+$/, '')
+      } catch { /* not bound yet */ }
+    }
+    const live = portState().current
+    return live > 0 ? `http://127.0.0.1:${live}` : ''
+  }
+
+  /**
+   * The token URL of this very process.
+   *
+   * The connection service owns the token, so it is asked first; the log is the
+   * fallback for a profile where that service is not injectable (the supervisor
+   * redirects the child's stdout there, so the same URL is in our own log).
+   */
+  function authenticatedUrl(origin) {
+    if (origin === '') return null
+    const base = `${origin}/`
+    const connection = typeof ctx.get === 'function' ? ctx.get('connection') : undefined
+    for (const candidate of [connection, connection?.browserAuth]) {
+      if (candidate === undefined || candidate === null) continue
+      if (typeof candidate.authenticatedUrl !== 'function') continue
+      try {
+        const url = candidate.authenticatedUrl(base)
+        if (typeof url === 'string' && url !== '') return url
+      } catch (error) {
+        warn(`the authentication url is unavailable: ${error?.message ?? error}`)
+      }
+    }
+    return tokenUrlFromLog(origin)
+  }
+
+  /** The `dsh web: <url>` line the child printed on its way up. */
+  function tokenUrlFromLog(origin) {
+    const text = tailFile(paths.dshLog, 400)
+    if (text === '') return null
+    const matches = [...text.matchAll(/dsh web:\s*https?:\/\/\S+\?token=([A-Za-z0-9_-]+)/g)]
+    if (matches.length === 0) return null
+    return `${origin}/?token=${matches[matches.length - 1][1]}`
+  }
+
+  /** What `/url` and `status.url` report. */
+  function urlState(req) {
+    const origin = runtimeOrigin()
+    const mode = settings.enterMode
+    const key = resolvedEntryKey()
+    // No request object means an internal caller: there is no socket to judge,
+    // so the peer check is skipped rather than failed.
+    const gate = req === undefined ? { ok: true, mode } : entryGate({ mode, key, req })
+    return {
+      current: origin === '' ? '' : `${origin}/`,
+      authenticated: gate.ok ? authenticatedUrl(origin) : null,
+      entry: buildEntryUrl(origin, { mode, key }),
+      mode,
+      port: portState().current,
+      gate: gate.ok ? 'ok' : gate.reason,
+    }
+  }
+
+  function entryRefusal(reason) {
+    if (reason === 'not-loopback') return 'this entry route answers loopback requests only; use enterMode=key (with entryKey) or enterMode=open behind a proxy\n'
+    if (reason === 'key-missing') return 'this entry route needs a key, but none is configured; set entryKey, or install once to generate one\n'
+    return 'the entry key does not match\n'
+  }
+
+  /**
+   * Perform the token exchange on the browser's behalf.
+   *
+   * The inner request deliberately carries the browser's own Host header: the
+   * cookie name is derived from the authority, so a request that claimed a
+   * different host would mint a cookie this browser could not use.
+   */
+  function exchangeToken(req, target) {
+    let parsed
+    try { parsed = new URL(target) } catch { return Promise.resolve({ ok: false, reason: 'bad-url', target }) }
+    // A TLS listener is left to the browser: the redirect below is the fallback.
+    if (parsed.protocol !== 'http:') return Promise.resolve({ ok: false, reason: 'not-plain-http', target })
+    const connectHost = parsed.hostname === '0.0.0.0' || parsed.hostname === '::' || parsed.hostname === '[::]' ? '127.0.0.1' : parsed.hostname
+    const host = typeof req?.headers?.host === 'string' && req.headers.host !== '' ? req.headers.host : parsed.host
+    // The app only exchanges the token on the root path, so a caller that built
+    // its URL as `origin + '/'` (one slash too many) is normalised here rather
+    // than silently falling through to the redirect.
+    const pathname = parsed.pathname === '' || parsed.pathname.startsWith('//') ? '/' : parsed.pathname
+    return new Promise((resolve) => {
+      let settled = false
+      const done = (value) => { if (!settled) { settled = true; resolve(value) } }
+      const inner = httpRequest({
+        host: connectHost,
+        port: Number(parsed.port) || 80,
+        method: 'GET',
+        path: `${pathname}${parsed.search}`,
+        headers: { host, accept: 'text/html' },
+        timeout: 5000,
+      }, (response) => {
+        const raw = response.headers['set-cookie']
+        const list = Array.isArray(raw) ? raw : raw === undefined ? [] : [String(raw)]
+        const cookie = list
+          .map((entry) => String(entry).split(';')[0])
+          .find((entry) => entry.startsWith('dsh-auth-') && entry.includes('='))
+        response.resume()
+        if (cookie === undefined) done({ ok: false, reason: `no-cookie-${String(response.statusCode)}`, target })
+        else done({ ok: true, cookie, target })
+      })
+      inner.on('timeout', () => { inner.destroy(); done({ ok: false, reason: 'timeout', target }) })
+      inner.on('error', (error) => done({ ok: false, reason: error?.message ?? String(error), target }))
+      inner.end()
+    })
+  }
+
+  /** The stable entry route: log the browser in, then land it on the app. */
+  async function handleEnter(req, res) {
+    if (req.method !== 'GET') {
+      res.writeHead(405, { allow: 'GET', 'cache-control': 'no-store' })
+      res.end()
+      return
+    }
+    const mode = settings.enterMode
+    const gate = entryGate({ mode, key: resolvedEntryKey(), req })
+    if (!gate.ok) {
+      info(`entry refused (${mode}): ${gate.reason}`)
+      sendText(res, gate.status ?? 403, entryRefusal(gate.reason))
+      return
+    }
+    const target = authenticatedUrl(runtimeOrigin())
+    if (target === null) {
+      sendText(res, 503, 'no browser authentication is available yet; open the URL printed by dsh web, or retry once the web app is up\n')
+      return
+    }
+    const exchanged = await exchangeToken(req, target)
+    if (exchanged.ok) {
+      // The cookie the app itself would have set, but the address bar keeps this
+      // stable URL instead of the one-time token.
+      res.writeHead(303, {
+        location: '/',
+        'set-cookie': exchanged.cookie,
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer',
+      })
+      res.end()
+      return
+    }
+    warn(`entry: token exchange failed (${exchanged.reason}); redirecting to the token url`)
+    res.writeHead(302, { location: target, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
+    res.end()
   }
 
   function appArgsFor(port) {
@@ -1075,6 +1387,14 @@ export function createManager(ctx, rawConfig) {
       const cli = writeCli()
       result.changed.push(...cli.changed)
       result.warnings.push(...cli.warnings)
+      // The entry key is a bookmark ingredient, so it is written once and kept;
+      // without it the key mode would answer 403 on the URL people saved.
+      if (settings.enterMode === 'key') {
+        const before = entryKeyOf(paths)
+        const key = ensureEntryKey()
+        if (key !== '' && before === '') result.changed.push('entry.json')
+        if (key === '') result.warnings.push(`enterMode=key but no entry key could be stored in ${paths.entry}`)
+      }
     } catch (error) {
       return finish({ ok: false, error: `cannot write the supervisor/units: ${error?.message ?? error}` })
     }
@@ -1523,7 +1843,7 @@ export function createManager(ctx, rawConfig) {
 
   // --- status --------------------------------------------------------------
 
-  async function status() {
+  async function status(req) {
     const back = await backend()
     const unit = settings.unitName
     const installed = isInstalled(unit)
@@ -1568,6 +1888,7 @@ export function createManager(ctx, rawConfig) {
       safeProfile: settings.safeProfile,
       appArgs: appArgs(),
       port: portState(),
+      url: urlState(req),
       supervisor: supervisorState(),
       client: clientState(),
       clientHeartbeat: clientHeartbeat(),
@@ -1586,6 +1907,8 @@ export function createManager(ctx, rawConfig) {
         port: resolvedPort(),
         safePort: resolvedSafePort(),
         portGuard: settings.portGuard,
+        enterMode: settings.enterMode,
+        entryKeySet: resolvedEntryKey() !== '',
       },
     }
   }
@@ -1644,7 +1967,7 @@ export function createManager(ctx, rawConfig) {
             // The page polls with hb=1; curl/agents do not, so only real pages
             // move the liveness timestamp.
             if (query(req).searchParams.get('hb') === '1') recordHeartbeat()
-            sendJson(res, 200, await status())
+            sendJson(res, 200, await status(req))
           } catch (error) { sendJson(res, 500, { ok: false, error: String(error?.message ?? error) }) }
         },
       },
@@ -1686,6 +2009,26 @@ export function createManager(ctx, rawConfig) {
           } catch (error) {
             sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
           }
+        },
+      },
+      {
+        kind: 'exact',
+        path: `${ROUTE_PREFIX}/url`,
+        handler: (req, res) => {
+          if (req.method !== 'GET') {
+            sendJson(res, 405, { ok: false, error: 'method-not-allowed', expected: 'GET' })
+            return
+          }
+          try { sendJson(res, 200, { ok: true, ...urlState(req) }) } catch (error) { sendJson(res, 500, { ok: false, error: String(error?.message ?? error) }) }
+        },
+      },
+      {
+        kind: 'exact',
+        path: `${ROUTE_PREFIX}/enter`,
+        handler: (req, res) => {
+          handleEnter(req, res).catch((error) => {
+            try { sendText(res, 500, `the entry route failed: ${error?.message ?? error}\n`) } catch { /* the socket is gone */ }
+          })
         },
       },
       {
@@ -1865,7 +2208,7 @@ export function createManager(ctx, rawConfig) {
     activated = false
   }
 
-  return { bindPort, activate, dispose, routes, status, install, uninstall, repair, selftest, planRestart, performRestart, clearSafeMode, setNextPort, portState, settings, paths }
+  return { bindPort, activate, dispose, routes, status, install, uninstall, repair, selftest, planRestart, performRestart, clearSafeMode, setNextPort, portState, urlState, settings, paths }
 }
 
 // ---------------------------------------------------------------------------
