@@ -369,6 +369,26 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 或在 Harness 的插件管理页里用同一 spec 安装。装好后插件会自动写 unit、enable 并开启 linger；
 当前手动运行的实例要等下次开机或点一次「重启」才由 systemd 接管。
 
+### 升级
+
+每个发布版本都打了 tag（当前 `v0.2.0`，对应 `package.json` 的 `version`）。升级就是再用同一个 spec 装一遍——
+它会重新解析到默认分支的最新提交并更新锁定：
+
+```bash
+dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
+```
+
+要钉住某个发布版本，把 tag 写在 spec 后面：
+
+```bash
+dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.2.0
+```
+
+装完点一次界面上的「重启」（或等下次开机），运行中的实例才会换成新版。
+
+> 插件管理页里的「升级」只对**从 npm registry 安装、且包名相同**的第三方包可用（本插件用 GitHub
+> spec 安装，`private` 也未发布到 npm），所以那里不会有可点的升级项——升级请走上面的命令。
+
 ## License
 
 MIT © 2026 Grant-Felix — 见 [LICENSE](LICENSE)。
