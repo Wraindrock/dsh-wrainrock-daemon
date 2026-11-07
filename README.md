@@ -371,8 +371,19 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 
 ### 升级
 
-每个发布版本都打了 tag（当前 `v0.2.0`，对应 `package.json` 的 `version`）。升级就是再用同一个 spec 装一遍——
-它会重新解析到默认分支的最新提交并更新锁定：
+每个发布版本都打 tag（当前 `v0.2.1`，与 `package.json` 的 `version` 一致）并发布为 GitHub Release。
+升级有两条路：
+
+**1. 市场（dshmarket）里一键升级。** 对 `github:` spec 的安装，市场比较「默认分支 HEAD 上
+`package.json` 的 `version`」与「已安装版本」：HEAD 版本变新才出现「有新版本 x.y.z」并提供更新。
+这个比较有 30 分钟缓存，刚发完版可以点界面上的「重新检查」立刻刷新。
+
+> 如果那里显示的是**「有新提交（未发版）<sha>」**而不是「有新版本」，说明市场读到的 HEAD 版本
+> 还没有前进（`raw.githubusercontent.com` 有缓存，或版本号提交尚未推上去）。按市场自己的规则
+> （见 dshmarket `lib/updates.js` 的 `gitVersionUpdate`、其 `unreleasedCommit` 字段），
+> 它只安装**正式版本**，不会自动装未发版的提交；等版本号前进或点「重新检查」即可。
+
+**2. 命令行重新安装。** 同一个 spec 再装一遍，会重新解析到默认分支的最新提交并更新锁定：
 
 ```bash
 dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
@@ -381,13 +392,14 @@ dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon
 要钉住某个发布版本，把 tag 写在 spec 后面：
 
 ```bash
-dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.2.0
+dsh plugin --profile web add github:Wraindrock/dsh-wrainrock-daemon#v0.2.1
 ```
 
-装完点一次界面上的「重启」（或等下次开机），运行中的实例才会换成新版。
+两条路装完都要点一次界面上的「重启」（或等下次开机），运行中的实例才会换成新版。
 
-> 插件管理页里的「升级」只对**从 npm registry 安装、且包名相同**的第三方包可用（本插件用 GitHub
-> spec 安装，`private` 也未发布到 npm），所以那里不会有可点的升级项——升级请走上面的命令。
+> 注意：Harness **自带**的插件管理页（`dsh-plugin-manager`）的「升级」只对从 npm registry 安装、
+> 且包名相同的第三方包可用——其 `updateRefusal()` 会以「不是从同名 registry 安装」拒绝 `github:`
+> 这类来源。本插件用的是 GitHub spec，所以那条路走不通，用上面的市场或命令行。
 
 ## License
 

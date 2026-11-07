@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-wrainrock-daemon",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "license": "MIT",
   "description": "systemd autostart, crash/safe-mode self-recovery and a manual 重启 button for DeepSeek Harness",
