@@ -2,5 +2,26 @@
   "meta": {
     "title": "Autostart & Guardian",
     "description": "systemd autostart, crash/corruption self-recovery with a safe mode, and a manual Restart button."
-  }
+  },
+  "sectionLabel": "Daemon",
+  "sectionIntro": "The listening port of the DeepSeek Harness service. Changing the next-start port only affects the next start; the current session is not interrupted.",
+  "portCurrent": "Current port",
+  "portNext": "Next-start port",
+  "portSourceLive": "Serving now",
+  "portSourceOverride": "From next-start override",
+  "portSourceConfig": "From configuration",
+  "portPending": "Takes effect after a restart",
+  "portLoading": "Loading…",
+  "portUnavailable": "Unavailable",
+  "portInvalid": "Enter an integer port between 1 and 65535",
+  "portSave": "Save",
+  "portSaveRestart": "Save & restart",
+  "portSaving": "Saving…",
+  "portRestarting": "Saving and restarting…",
+  "portSaved": "Saved — takes effect on the next start",
+  "portSavedRestart": "Saved — the service is restarting; reload the page in a moment",
+  "portFailed": "Save failed",
+  "cloudflareLabel": "Forward to a Cloudflare domain",
+  "cloudflareBadge": "Experimental · in development",
+  "cloudflareHint": "Placeholder: forward this local service to a Cloudflare domain. Not available yet and cannot be enabled for now."
 }

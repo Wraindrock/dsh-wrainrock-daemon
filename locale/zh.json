@@ -2,5 +2,26 @@
   "meta": {
     "title": "开机自启与看护",
     "description": "用 systemd 实现开机自启动；崩溃或配置损坏时自动恢复，多次失败则进入安全模式并汇报；提供手动“重启”按钮。"
-  }
+  },
+  "sectionLabel": "Daemon",
+  "sectionIntro": "DeepSeek Harness 服务的监听端口。修改「下次启动端口」只影响下一次启动，不会中断当前会话。",
+  "portCurrent": "当前端口",
+  "portNext": "下次启动端口",
+  "portSourceLive": "实际运行中",
+  "portSourceOverride": "来自下次启动覆盖",
+  "portSourceConfig": "来自配置",
+  "portPending": "重启后生效",
+  "portLoading": "读取中…",
+  "portUnavailable": "不可用",
+  "portInvalid": "请输入 1–65535 之间的整数端口",
+  "portSave": "保存",
+  "portSaveRestart": "保存并重启",
+  "portSaving": "保存中…",
+  "portRestarting": "保存并重启中…",
+  "portSaved": "已保存，下次启动生效",
+  "portSavedRestart": "已保存，服务即将重启；页面稍后需要刷新",
+  "portFailed": "保存失败",
+  "cloudflareLabel": "转发至 Cloudflare 域名",
+  "cloudflareBadge": "实验性·开发中",
+  "cloudflareHint": "占位功能：把本地服务转发到一个 Cloudflare 域名，目前尚未开放，暂时无法开启。"
 }

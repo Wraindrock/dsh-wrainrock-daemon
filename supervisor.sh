@@ -50,9 +50,17 @@ SAFE_TEMPLATE="${DSH_WRAINROCK_DAEMON_SAFE_TEMPLATE:-@@SAFE_TEMPLATE@@}"
 APP_ARGS="${DSH_WRAINROCK_DAEMON_APP_ARGS:-@@APP_ARGS@@}"
 SAFE_APP_ARGS="${DSH_WRAINROCK_DAEMON_SAFE_APP_ARGS:-@@SAFE_APP_ARGS@@}"
 # Baked as values of their own (never parsed back out of APP_ARGS) so the port
-# guards below can never disagree with the command line actually launched.
-PORT="${DSH_WRAINROCK_DAEMON_PORT:-@@PORT@@}"
-SAFE_PORT="${DSH_WRAINROCK_DAEMON_SAFE_PORT:-@@SAFE_PORT@@}"
+# guards below can never disagree with the command line actually launched. A
+# runtime request in <state>/port.json (written by the `dwd` CLI / the Settings
+# page) or an explicit environment value moves them again further down.
+BAKED_PORT="@@PORT@@"
+BAKED_SAFE_PORT="@@SAFE_PORT@@"
+PORT="${DSH_WRAINROCK_DAEMON_PORT:-$BAKED_PORT}"
+SAFE_PORT="${DSH_WRAINROCK_DAEMON_SAFE_PORT:-$BAKED_SAFE_PORT}"
+# `1` exactly when the operator really set the variable: an explicit value must
+# beat <state>/port.json, which in turn beats the baked pair.
+PORT_EXPLICIT="${DSH_WRAINROCK_DAEMON_PORT:+1}"
+SAFE_PORT_EXPLICIT="${DSH_WRAINROCK_DAEMON_SAFE_PORT:+1}"
 PORT_GUARD="${DSH_WRAINROCK_DAEMON_PORT_GUARD:-@@PORT_GUARD@@}"
 STANDBY_POLL="${DSH_WRAINROCK_DAEMON_STANDBY_POLL:-5}"
 UNIT_NAME="${DSH_WRAINROCK_DAEMON_UNIT:-@@UNIT_NAME@@}"
@@ -146,6 +154,103 @@ rotate_logs() {  if [ -f "$LOG" ] && [ "$(wc -l <"$LOG" 2>/dev/null || echo 0)" 
     rm -f "$old"
   done
 }
+
+# --- runtime port override ----------------------------------------------------
+# The host half (the `dwd` CLI and the Settings → Daemon page) records the port
+# the *next* start must use in <state>/port.json, so moving a port never has to
+# regenerate this script:
+#   { "port": <1..65535>, "safePort": <1..65535|null>, "at": "<ISO>", "by": "cli"|"ui" }
+# Parsed with grep/sed only — jq may not be installed. `"safePort"` does not
+# contain the literal substring `"port"` (capital P), so matching the plain key
+# is unambiguous. Precedence per port: explicit environment value > the request
+# file > the baked pair; absent, unreadable or invalid entries are ignored.
+# This runs after STATE_DIR exists and before LOCK_FILE and APP_ARGV, so the
+# lock name, the port guards, the "peer owns the port" logic and the launched
+# command line all agree on the same effective ports.
+PORT_FILE="$STATE_DIR/port.json"
+
+json_number() { # file key
+  grep -o "\"$2\"[[:space:]]*:[[:space:]]*[0-9]\+" "$1" 2>/dev/null |
+    grep -o '[0-9]\+' | head -n1
+}
+
+# Canonical decimal for a port string in 1..65535; empty (status 1) when the
+# value is not a usable port. `10#` keeps a hand-edited `04501` from being read
+# as octal, matching the host half's own port validation.
+port_or_empty() { # value
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 5 ] || return 1
+  local n=$((10#$1))
+  [ "$n" -ge 1 ] && [ "$n" -le 65535 ] || return 1
+  printf '%s' "$n"
+}
+
+# Rewrite the `--port` token of one generated argument line so the launched
+# command carries the *effective* port, not only the baked one. Handles both
+# `--port N` and `--port=N`, and appends the flag when the line has none. The
+# line is tokenised exactly like the `read -r -a` it feeds: whitespace only, no
+# glob expansion.
+retarget_port_args() { # args port
+  local args="$1" port="$2" out="" tok found=0 expect=0
+  local -a argv
+  read -r -a argv <<<"$args"
+  if [ "${#argv[@]}" -gt 0 ]; then
+    for tok in "${argv[@]}"; do
+      if [ "$expect" = "1" ]; then
+        expect=0
+        out="$out --port $port"
+        continue
+      fi
+      case "$tok" in
+        --port) expect=1; found=1 ;;
+        --port=*) found=1; out="$out --port=$port" ;;
+        *) out="$out $tok" ;;
+      esac
+    done
+  fi
+  if [ "$expect" = "1" ]; then out="$out --port $port"; fi
+  if [ "$found" = "0" ]; then out="$out --port $port"; fi
+  printf '%s' "${out# }"
+}
+
+env_port="$(port_or_empty "$PORT")"
+env_safe_port="$(port_or_empty "$SAFE_PORT")"
+file_port="$(port_or_empty "$(json_number "$PORT_FILE" port)")"
+file_safe_port="$(port_or_empty "$(json_number "$PORT_FILE" safePort)")"
+
+PORT_SOURCE="baked"
+if [ "$PORT_EXPLICIT" = "1" ] && [ -n "$env_port" ]; then
+  PORT="$env_port"
+  PORT_SOURCE="env"
+elif [ "$PORT_EXPLICIT" != "1" ] && [ -n "$file_port" ]; then
+  PORT="$file_port"
+  PORT_SOURCE="request file"
+else
+  PORT="$BAKED_PORT"
+fi
+
+port_num="$(port_or_empty "$PORT")"
+SAFE_PORT_SOURCE="baked"
+if [ "$SAFE_PORT_EXPLICIT" = "1" ] && [ -n "$env_safe_port" ]; then
+  SAFE_PORT="$env_safe_port"
+  SAFE_PORT_SOURCE="env"
+elif [ "$SAFE_PORT_EXPLICIT" != "1" ] && [ -n "$file_safe_port" ]; then
+  SAFE_PORT="$file_safe_port"
+  SAFE_PORT_SOURCE="request file"
+elif [ "$SAFE_PORT_EXPLICIT" != "1" ] && [ "$PORT" != "$BAKED_PORT" ] &&
+  [ -n "$port_num" ] && [ "$port_num" -lt 65535 ]; then
+  # A request that moved the main port without naming a safe one: keep safe mode
+  # beside it instead of reusing the baked pair (which may now be occupied).
+  SAFE_PORT=$((port_num + 1))
+  SAFE_PORT_SOURCE="port+1"
+else
+  SAFE_PORT="$BAKED_SAFE_PORT"
+fi
+
+if [ "$PORT" != "$BAKED_PORT" ] || [ "$SAFE_PORT" != "$BAKED_SAFE_PORT" ]; then
+  export PORT SAFE_PORT
+  log "port override: port=$PORT ($PORT_SOURCE), safe=$SAFE_PORT ($SAFE_PORT_SOURCE); baked $BAKED_PORT/$BAKED_SAFE_PORT"
+fi
 
 # --- singleton lock + peer awareness -----------------------------------------
 # Two systemd *user managers* for one account (for example user@1000.service AND
@@ -529,6 +634,16 @@ trap 'stop=1' TERM INT
 
 read -r -a APP_ARGV <<<"$APP_ARGS"
 read -r -a SAFE_APP_ARGV <<<"$SAFE_APP_ARGS"
+
+# The effective ports may come from <state>/port.json or the environment rather
+# than from the baked APP_ARGS: make the launched command line carry exactly the
+# ports the lock name and the port guards above already agree on.
+if [ "$PORT" != "$BAKED_PORT" ]; then
+  read -r -a APP_ARGV <<<"$(retarget_port_args "$APP_ARGS" "$PORT")"
+fi
+if [ "$SAFE_PORT" != "$BAKED_SAFE_PORT" ]; then
+  read -r -a SAFE_APP_ARGV <<<"$(retarget_port_args "$SAFE_APP_ARGS" "$SAFE_PORT")"
+fi
 
 # Only one supervisor may own this profile+port. A second one (typically the
 # same unit started by a second systemd user manager) stands by here and takes

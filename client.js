@@ -50,6 +50,28 @@ window.__ModuleLoader__.load({
       temporaryDisabled: '临时禁用',
       temporaryDisabledHint: '本次启动临时禁用了 {ids}（崩溃自动恢复）；服务稳定运行后会自动撤销',
       temporaryDisabledAria: '本次启动临时禁用了 {ids}',
+      // Settings → Daemon: the service port and the disabled Cloudflare row.
+      sectionLabel: 'Daemon',
+      sectionIntro: 'DeepSeek Harness 服务的监听端口。修改「下次启动端口」只影响下一次启动，不会中断当前会话。',
+      portCurrent: '当前端口',
+      portNext: '下次启动端口',
+      portSourceLive: '实际运行中',
+      portSourceOverride: '来自下次启动覆盖',
+      portSourceConfig: '来自配置',
+      portPending: '重启后生效',
+      portLoading: '读取中…',
+      portUnavailable: '不可用',
+      portInvalid: '请输入 1–65535 之间的整数端口',
+      portSave: '保存',
+      portSaveRestart: '保存并重启',
+      portSaving: '保存中…',
+      portRestarting: '保存并重启中…',
+      portSaved: '已保存，下次启动生效',
+      portSavedRestart: '已保存，服务即将重启；页面稍后需要刷新',
+      portFailed: '保存失败',
+      cloudflareLabel: '转发至 Cloudflare 域名',
+      cloudflareBadge: '实验性·开发中',
+      cloudflareHint: '占位功能：把本地服务转发到一个 Cloudflare 域名，目前尚未开放，暂时无法开启。',
     }
     const en = {
       restart: 'Restart',
@@ -66,6 +88,27 @@ window.__ModuleLoader__.load({
       temporaryDisabled: 'Temp disabled',
       temporaryDisabledHint: 'This boot temporarily disabled {ids} (automatic crash recovery); it is re-enabled once the service stays healthy',
       temporaryDisabledAria: 'This boot temporarily disabled {ids}',
+      sectionLabel: 'Daemon',
+      sectionIntro: 'The listening port of the DeepSeek Harness service. Changing the next-start port only affects the next start; the current session is not interrupted.',
+      portCurrent: 'Current port',
+      portNext: 'Next-start port',
+      portSourceLive: 'Serving now',
+      portSourceOverride: 'From next-start override',
+      portSourceConfig: 'From configuration',
+      portPending: 'Takes effect after a restart',
+      portLoading: 'Loading…',
+      portUnavailable: 'Unavailable',
+      portInvalid: 'Enter an integer port between 1 and 65535',
+      portSave: 'Save',
+      portSaveRestart: 'Save & restart',
+      portSaving: 'Saving…',
+      portRestarting: 'Saving and restarting…',
+      portSaved: 'Saved — takes effect on the next start',
+      portSavedRestart: 'Saved — the service is restarting; reload the page in a moment',
+      portFailed: 'Save failed',
+      cloudflareLabel: 'Forward to a Cloudflare domain',
+      cloudflareBadge: 'Experimental · in development',
+      cloudflareHint: 'Placeholder: forward this local service to a Cloudflare domain. Not available yet and cannot be enabled for now.',
     }
 
     const CSS = `
@@ -95,6 +138,32 @@ window.__ModuleLoader__.load({
 .dsa-badge{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 6px;
   border:1px solid var(--dsw-alias-state-warn-primary);border-radius:999px;
   color:var(--dsw-alias-state-warn-primary);font-size:10px;line-height:1;white-space:nowrap}
+/* Settings → Daemon. Card/fill tokens match the other settings sections. */
+.dsa-sec{display:flex;flex-direction:column;gap:16px;padding:8px 0;
+  color:var(--dsw-alias-label-primary);font-size:13px;line-height:22px}
+.dsa-card{display:flex;flex-direction:column;gap:10px;box-sizing:border-box;padding:12px 16px;
+  border:.5px solid var(--dsw-alias-settings-card-stroke,var(--dsw-alias-border-l2));
+  border-radius:var(--dsw-radius-xl,12px);background:var(--dsw-alias-settings-card-fill,transparent)}
+.dsa-field{display:flex;flex-direction:column;gap:6px}
+.dsa-label{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
+.dsa-value{font-size:16px;font-weight:500;line-height:24px}
+.dsa-hint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.dsa-warnText{color:var(--dsw-alias-state-warn-primary)}
+.dsa-okText{color:var(--dsw-alias-state-business-primary)}
+.dsa-errText{color:var(--dsw-alias-state-error-primary)}
+.dsa-inline{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.dsa-input{box-sizing:border-box;width:120px;height:32px;padding:0 10px;font:inherit;font-size:13px;
+  border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm,6px);
+  background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
+.dsa-input:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid
+  var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
+.dsa-btn.dsa-primary{border-color:transparent;background:var(--dsw-alias-button-primary-fill);
+  color:var(--dsw-alias-label-primary-foreground);font-weight:500}
+.dsa-btn.dsa-primary:hover:not([disabled]){background:var(--dsw-alias-button-primary-hover);
+  color:var(--dsw-alias-label-primary-foreground)}
+/* The experimental Cloudflare row is a plain, non-interactive div. */
+.dsa-row.dsa-disabled{cursor:default;opacity:.6}
+.dsa-row.dsa-disabled:hover{background:0 0}
 `
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -125,6 +194,52 @@ window.__ModuleLoader__.load({
       const response = await fetch(`${BASE}/status?hb=1`, { cache: 'no-store' })
       if (!response.ok) throw new Error(`status ${response.status}`)
       return await response.json()
+    }
+
+    /**
+     * Port snapshot for Settings → Daemon. `GET /port` is the primary route;
+     * an older host half that lacks it still carries the same shape under
+     * `status.port`, so fall back to that instead of failing. Returns null when
+     * neither route answers — the section then renders the 不可用 state.
+     */
+    async function readPortSnapshot() {
+      try {
+        const response = await fetch(`${BASE}/port`, { cache: 'no-store' })
+        if (response.ok) {
+          const data = await response.json()
+          if (data && typeof data === 'object' && data.ok !== false) return data
+        }
+      } catch {
+        /* route missing, daemon down or a malformed body — try the status route */
+      }
+      try {
+        const status = await readStatus()
+        const port = status?.port
+        if (port && typeof port === 'object') return { ok: true, ...port }
+      } catch {
+        /* both routes are unavailable; the caller renders 不可用 */
+      }
+      return null
+    }
+
+    /** Client-side range check (integer 1..65535); null means "not a valid port". */
+    function parsePortInput(raw) {
+      const text = typeof raw === 'number' ? String(raw) : String(raw ?? '').trim()
+      if (!/^\d{1,5}$/.test(text)) return null
+      const port = Number(text)
+      return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null
+    }
+
+    /** Locale key for the snapshot's `source`; unknown values read as "live". */
+    function portSourceKey(source) {
+      if (source === 'override') return 'portSourceOverride'
+      if (source === 'config') return 'portSourceConfig'
+      return 'portSourceLive'
+    }
+
+    /** Query string for the save request; `restart=1` asks the host to restart. */
+    function portQuery(port, restart) {
+      return `/port?port=${port}${restart ? '&restart=1' : ''}`
     }
 
     /**
@@ -401,6 +516,162 @@ window.__ModuleLoader__.load({
         wide ? h(RecoveryBadge, { ids, t, compact: true }) : null)
     }
 
+    /**
+     * Settings → Daemon. Owns one snapshot of the port state and the next-start
+     * form. Every fetch is failure-tolerant: an absent route (old host half) or
+     * a dead daemon renders a short 不可用 state instead of breaking the panel.
+     */
+    function PortSection(props) {
+      const t = props.t
+      const [snapshot, setSnapshot] = React.useState(null)
+      const [ready, setReady] = React.useState(false)
+      const [draft, setDraft] = React.useState('')
+      const [note, setNote] = React.useState(null)
+      const [busy, setBusy] = React.useState(false)
+      // React.useRef with a stand-in for the dependency-free test stub.
+      const live = typeof React.useRef === 'function' ? React.useRef(true) : { current: true }
+
+      const adopt = (next) => {
+        if (!live.current) return
+        setSnapshot(next)
+        // Prefer the port the next start would use, but never seed the input with
+        // 0 ("let dsh pick"), which the range check would then reject on save.
+        const candidates = [next?.next, next?.current]
+        const value = candidates.find((candidate) => Number.isInteger(candidate) && candidate > 0)
+        setDraft(value === undefined ? '' : String(value))
+      }
+
+      const load = () => {
+        readPortSnapshot()
+          .then((next) => { adopt(next); if (live.current) setReady(true) })
+          .catch(() => { adopt(null); if (live.current) setReady(true) })
+      }
+
+      React.useEffect(() => {
+        live.current = true
+        load()
+        return () => { live.current = false }
+        // Runs once per mount: the section is remounted whenever it is opened.
+      }, [])
+
+      const submit = (restart) => {
+        if (busy) return
+        const port = parsePortInput(draft)
+        if (port === null) {
+          setNote({ kind: 'error', text: t('portInvalid') })
+          return
+        }
+        setBusy(true)
+        setNote({ kind: 'busy', text: restart ? t('portRestarting') : t('portSaving') })
+        let request
+        try {
+          request = postJson(portQuery(port, restart), '')
+        } catch (error) {
+          setBusy(false)
+          setNote({ kind: 'error', text: `${t('portFailed')} (${String(error?.message ?? error)})` })
+          return
+        }
+        Promise.resolve(request).then(async (response) => {
+          let data = null
+          try { data = await response.json() } catch { data = null }
+          // A restart answers 202 and may carry no JSON body: accept any 2xx and
+          // only treat an explicit { ok:false } as a failure. Prefer the host's
+          // human message (e.g. "expected an integer 1..65535") over its code.
+          if (data && data.ok === false) {
+            const detail = data.message || data.error
+            throw new Error(detail ? String(detail) : `HTTP ${response.status}`)
+          }
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          return data
+        }).then((data) => {
+          if (!live.current) return
+          setBusy(false)
+          // The save response carries the same state shape, so adopt it; if it is
+          // empty (bare 202) re-read the live value instead.
+          if (data && typeof data === 'object') adopt(data)
+          else load()
+          setNote({ kind: 'ok', text: restart ? t('portSavedRestart') : t('portSaved') })
+        }).catch((error) => {
+          if (!live.current) return
+          setBusy(false)
+          setNote({ kind: 'error', text: `${t('portFailed')} (${String(error?.message ?? error)})` })
+        })
+      }
+
+      const port = snapshot && typeof snapshot === 'object' ? snapshot : null
+      const current = port && Number.isInteger(port.current) ? String(port.current) : null
+      const pending = port !== null && (port.pending === true
+        || (port.pending === undefined && Number.isInteger(port.next)
+          && Number.isInteger(port.current) && port.next !== port.current))
+      const noteClass = note?.kind === 'error' ? 'dsa-errText'
+        : note?.kind === 'ok' ? 'dsa-okText' : 'dsa-hint'
+
+      return h('div', { className: 'dsa-sec', 'data-dsa-section': 'daemon' },
+        h('style', null, CSS),
+        h('p', { className: 'dsa-hint' }, t('sectionIntro')),
+        h('div', { className: 'dsa-card' },
+          h('div', { className: 'dsa-field' },
+            h('span', { className: 'dsa-label' }, t('portCurrent')),
+            h('span', { className: 'dsa-inline' },
+              h('span', {
+                className: 'dsa-value',
+                'data-dsa-current': current ?? '',
+              }, current === null ? t('portUnavailable') : current),
+              port ? h('span', { className: 'dsa-hint' }, t(portSourceKey(port.source))) : null)),
+          h('div', { className: 'dsa-field' },
+            h('label', { className: 'dsa-label', htmlFor: 'dsa-port-next' }, t('portNext')),
+            h('span', { className: 'dsa-inline' },
+              h('input', {
+                id: 'dsa-port-next',
+                className: 'dsa-input',
+                type: 'number',
+                min: 1,
+                max: 65535,
+                step: 1,
+                inputMode: 'numeric',
+                value: draft,
+                disabled: busy,
+                'aria-label': t('portNext'),
+                onChange: (event) => {
+                  setDraft(event?.target?.value ?? '')
+                  if (note && note.kind !== 'ok') setNote(null)
+                },
+                onKeyDown: (event) => {
+                  if (event?.key === 'Enter') {
+                    if (typeof event.preventDefault === 'function') event.preventDefault()
+                    submit(false)
+                  }
+                },
+              }),
+              h('button', {
+                type: 'button', className: 'dsa-btn', disabled: busy, onClick: () => submit(false),
+              }, t('portSave')),
+              h('button', {
+                type: 'button', className: 'dsa-btn dsa-primary', disabled: busy, onClick: () => submit(true),
+              }, t('portSaveRestart'))),
+            pending ? h('p', { className: 'dsa-hint dsa-warnText', 'data-dsa-pending': '1' }, t('portPending')) : null,
+            note ? h('p', {
+              className: noteClass, 'data-dsa-note': note.kind, role: 'status',
+            }, note.text) : null,
+            !ready ? h('p', { className: 'dsa-hint' }, t('portLoading')) : null)),
+        h('div', { className: 'dsa-card' },
+          h('div', {
+            className: 'dsa-row dsa-disabled',
+            'aria-disabled': 'true',
+            'data-dsa-experimental': 'cloudflare',
+            title: t('cloudflareHint'),
+          },
+          h('span', { className: 'dsa-rowLabel' }, t('cloudflareLabel')),
+          h('span', { className: 'dsa-badge' }, t('cloudflareBadge'))),
+          h('p', { className: 'dsa-hint' }, t('cloudflareHint'))))
+    }
+
+    /** Last-resort settings page: a crash must not blank the panel entry. */
+    function PlainSection(props) {
+      return h('div', { className: 'dsa-sec' },
+        h('p', { className: 'dsa-hint', style: { margin: 0 } }, props.t('portUnavailable')))
+    }
+
     /** Plain, dependency-free control: shown if the styled one ever throws. */
     function PlainControl(props) {
       return h('button', {
@@ -467,12 +738,12 @@ window.__ModuleLoader__.load({
         // Rebuild the flow so its notices use the locale resolved above.
         FLOW = createRestartFlow({ translate })
 
-        const register = (slot, id, order, make) => ctx.effect(
+        const register = (slot, id, order, make, labelKey = 'restart') => ctx.effect(
           () => ctx.slots.inject(slot, () => ctx.slots.register({
             name: slot,
             id,
             order,
-            label: () => translate('restart'),
+            label: () => translate(labelKey),
           }, make)),
           `dsh-wrainrock-daemon: ${id}`,
         )
@@ -484,10 +755,16 @@ window.__ModuleLoader__.load({
         register('sidebar.footer.action', 'dsh-wrainrock-daemon-sidebar', -10,
           (props) => h(SafeBoundary, { fallback: h(PlainControl, { label: translate('restart'), title: translate('hint') }) },
             h(SidebarControl, { t: translate, wide: props?.wide })))
+
+        // Settings → Daemon, slotted between 模型 (10) and 插件 (15).
+        register('settings.section', 'daemon', 12,
+          () => h(SafeBoundary, { fallback: h(PlainSection, { t: translate }) },
+            h(PortSection, { t: translate })),
+          'sectionLabel')
       },
       // Test seam: the restart lifecycle is the part that must not regress and
       // the part a browser cannot be driven into reproducing here.
-      __test: { createRestartFlow, decideAfterPoll, recoveryIds, fillIds },
+      __test: { createRestartFlow, decideAfterPoll, recoveryIds, fillIds, parsePortInput, portSourceKey, portQuery, readPortSnapshot },
     }
   },
 })

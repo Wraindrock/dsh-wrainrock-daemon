@@ -31,7 +31,7 @@
  *   GET  log         text tail of the supervisor log
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, lstatSync, unlinkSync, copyFileSync, cpSync, renameSync, statSync, openSync, readSync, closeSync, chmodSync, realpathSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, readlinkSync, lstatSync, unlinkSync, copyFileSync, cpSync, renameSync, statSync, openSync, readSync, closeSync, chmodSync, realpathSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir, userInfo } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
@@ -127,6 +127,103 @@ function writeIfChanged(path, content, mode) {
 
 function ensureDir(path) {
   try { mkdirSync(path, { recursive: true }) } catch { /* reported by the caller's next write */ }
+}
+
+// --- the requested port ------------------------------------------------------
+//
+// "Which port does it listen on?" has two answers that must not be confused:
+// the one serving right now, and the one the next start will use. The second is
+// a request, not a setting: it is kept next to the rest of the runtime state
+// (`state/port.json`) so the generated supervisor can honour it without being
+// rewritten, and so a port that turns out to be wrong can be changed by hand
+// while the daemon is down.
+
+/**
+ * A user-supplied port, or 0 for "not a port at all".
+ *
+ * `0` is deliberately not accepted: it already means "let dsh pick one" in the
+ * config, so treating it as an override would silently pin nothing.
+ */
+export function parsePortValue(value) {
+  if (value === null || value === undefined) return 0
+  if (typeof value === 'number' && !Number.isInteger(value)) return 0
+  const text = String(value).trim()
+  if (!/^[0-9]{1,5}$/.test(text)) return 0
+  const port = Number(text)
+  return port >= 1 && port <= 65535 ? port : 0
+}
+
+/** Where the next-start port request lives. */
+export function portOverridePath(paths) {
+  return join(paths.stateDir, 'port.json')
+}
+
+/**
+ * Read the next-start port request.
+ *
+ * Anything unreadable is the same as absent — a truncated or hand-edited file
+ * must never stop the daemon from starting on the configured port.
+ *
+ * @returns `{ port, safePort, at, by }` or `null`.
+ */
+export function readPortOverride(paths, options = {}) {
+  const file = options.file ?? portOverridePath(paths)
+  const raw = readText(file)
+  if (raw === undefined) return null
+  let parsed
+  try { parsed = JSON.parse(raw) } catch { return null }
+  if (parsed === null || typeof parsed !== 'object') return null
+  const port = parsePortValue(parsed.port)
+  if (port === 0) return null
+  const safe = parsePortValue(parsed.safePort)
+  return {
+    port,
+    safePort: safe > 0 ? safe : null,
+    at: typeof parsed.at === 'string' ? parsed.at : undefined,
+    by: parsed.by === 'cli' || parsed.by === 'ui' ? parsed.by : undefined,
+    file,
+  }
+}
+
+/**
+ * The single shape both `/port` and `/status.port` expose, so the page, the CLI
+ * and the docs never have to agree on two vocabularies.
+ *
+ * `current` is what answers requests now, `next` is what the next start will
+ * use, and `pending` means "restart to apply". `override` says a request file
+ * exists even when it happens to name the port already in use.
+ */
+export function portSnapshot({ livePort = 0, port = 0, safePort = 0, override = null } = {}) {
+  const live = parsePortValue(livePort)
+  const configured = parsePortValue(port)
+  const requested = override ? parsePortValue(override.port) : 0
+  const requestedSafe = override ? parsePortValue(override.safePort) : 0
+  const configuredSafe = parsePortValue(safePort)
+
+  const current = live > 0 ? live : configured
+  const next = requested > 0 ? requested : configured
+  const source = live > 0 ? 'live' : requested > 0 ? 'override' : 'config'
+  // Safe mode sits one above whichever port the next start will actually use —
+  // including the live one when nothing is configured, which is exactly what
+  // resolvedSafePort() does for the generated supervisor.
+  const base = next > 0 ? next : current
+  const nextSafe = requested > 0
+    ? (requestedSafe > 0 ? requestedSafe : base > 0 ? base + 1 : 0)
+    : (configuredSafe > 0 ? configuredSafe : base > 0 ? base + 1 : 0)
+
+  return {
+    current,
+    source,
+    next,
+    nextSafe,
+    // Kept as its own key for readers that only care about safe mode; it is the
+    // port the NEXT start uses, never the one running now.
+    safePort: nextSafe,
+    override: requested > 0,
+    pending: requested > 0 && requested !== current,
+    requestedAt: override?.at,
+    requestedBy: override?.by,
+  }
 }
 
 /** Replace `@@TOKEN@@` placeholders in a shipped template. */
@@ -410,6 +507,10 @@ export function createManager(ctx, rawConfig) {
     notify: asBoolean(config.notify, true),
     nodeBin: asString(config.nodeBin, process.execPath),
     cliPath: expandHome(asString(config.cliPath, ''), home),
+    // Where the `dwd` shim is linked so a plain shell can find it. `$HOME/bin`
+    // is first on PATH on the machines this was built for; an explicit empty
+    // value falls back to it, and a symlink is never written over a real file.
+    cliDir: expandHome(asString(config.cliDir, ''), home),
     // Names this project used before it was called dsh-wrainrock-daemon. An
     // install made under any of them migrates itself on the first install()
     // (see migrateLegacy), so upgrading machines need no manual step.
@@ -437,6 +538,7 @@ export function createManager(ctx, rawConfig) {
     binDir: join(homeDir, 'bin'),
     supervisor: join(homeDir, 'bin', 'supervisor.sh'),
     relaunch: join(homeDir, 'bin', 'relaunch.sh'),
+    cli: join(homeDir, 'bin', 'dwd'),
     stateDir: join(homeDir, 'state'),
     reportDir: join(homeDir, 'reports'),
     logDir: join(homeDir, 'logs'),
@@ -497,6 +599,77 @@ export function createManager(ctx, rawConfig) {
     if (configured > 0) return configured
     const port = resolvedPort()
     return port > 0 ? port + 1 : 0
+  }
+
+  /** The next-start port request as it was stored, or null. */
+  function portOverride() { return readPortOverride(paths) }
+
+  /**
+   * The one shape `/port` and `/status` expose (see portSnapshot).
+   *
+   * "next" is what a freshly generated supervisor would carry, which is exactly
+   * resolvedPort(): the live port when nothing is configured, because install()
+   * bakes the live port. Passing settings.port here instead would report 0
+   * ("let dsh pick") on a machine whose supervisor is in fact pinned to 3080.
+   */
+  function portState() {
+    return portSnapshot({
+      livePort,
+      port: resolvedPort(),
+      safePort: resolvedSafePort(),
+      override: portOverride(),
+    })
+  }
+
+  /**
+   * Record the port the NEXT start should use.
+   *
+   * This writes a file rather than a setting: the generated supervisor reads it
+   * on its way up, so the request works while the daemon is down, applies to a
+   * restart nobody here performed, and can be undone by deleting one file.
+   */
+  function setNextPort(next, { safePort = null, by = 'ui' } = {}) {
+    const port = parsePortValue(next)
+    if (port === 0) {
+      return { ok: false, error: 'invalid-port', message: `not a port: ${String(next).slice(0, 24)}; expected an integer 1..65535` }
+    }
+    const safeRaw = safePort === null || safePort === undefined ? '' : String(safePort).trim()
+    const safe = parsePortValue(safeRaw)
+    if (safeRaw !== '' && safe === 0) {
+      return { ok: false, error: 'invalid-safe-port', message: `not a port: ${safeRaw.slice(0, 24)}; expected an integer 1..65535`, value: safeRaw }
+    }
+    const record = { port, safePort: safe > 0 ? safe : null, at: new Date().toISOString(), by: by === 'cli' ? 'cli' : 'ui' }
+    const changed = []
+    try {
+      ensureDir(paths.stateDir)
+      if (writeIfChanged(portOverridePath(paths), `${JSON.stringify(record, null, 2)}\n`, 0o644)) changed.push('port.json')
+    } catch (error) {
+      return { ok: false, error: 'write-failed', message: `cannot write ${portOverridePath(paths)}: ${error?.message ?? error}` }
+    }
+    recordEvent('host', 'port:set', { port, safePort: record.safePort, by: record.by })
+    writeRuntime()
+    info(`next start port: ${port}${record.safePort === null ? '' : ` (safe ${record.safePort})`} requested by ${record.by}`)
+    return { ok: true, changed, record }
+  }
+
+  /**
+   * Describe the running instance for the `dwd` CLI, so it can reach this port
+   * without guessing, scanning `ps`, or parsing the supervisor log.
+   */
+  function writeRuntime() {
+    try {
+      const state = portState()
+      ensureDir(paths.stateDir)
+      const record = {
+        pid: process.pid,
+        port: state.current,
+        safePort: state.nextSafe,
+        unit: settings.unitName,
+        profile: settings.profile,
+        at: new Date().toISOString(),
+      }
+      writeFileSync(join(paths.stateDir, 'runtime.json'), `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+    } catch { /* the CLI falls back to systemd when this is missing */ }
   }
 
   function appArgsFor(port) {
@@ -740,6 +913,51 @@ export function createManager(ctx, rawConfig) {
     return changed
   }
 
+  /** Where `dwd` is linked; `$HOME/bin` is the first entry of PATH here. */
+  function cliDir() {
+    return settings.cliDir !== '' ? settings.cliDir : join(home, 'bin')
+  }
+
+  /**
+   * Install the `dwd` command: the script itself under bin/, plus `dwd` and
+   * `dsh-wrainrock-daemon` names in a directory that is already on PATH.
+   *
+   * A path that already holds something that is not our symlink is left alone —
+   * a command shim must never delete a file the user put there.
+   */
+  function writeCli() {
+    const changed = []
+    const warnings = []
+    const values = templateValues()
+    if (writeIfChanged(paths.cli, render(template('dwd.sh'), values), 0o755)) changed.push('dwd')
+    const dir = cliDir()
+    for (const name of ['dwd', 'dsh-wrainrock-daemon']) {
+      const link = join(dir, name)
+      try {
+        let existing
+        try { existing = lstatSync(link) } catch { existing = undefined }
+        if (existing !== undefined) {
+          if (existing.isSymbolicLink() && readlinkSync(link) === paths.cli) continue
+          if (!existing.isSymbolicLink()) {
+            warnings.push(`${link} already exists and was left alone; run ${paths.cli} directly`)
+            continue
+          }
+          unlinkSync(link)
+        }
+        ensureDir(dir)
+        symlinkSync(paths.cli, link)
+        changed.push(`${name} (link)`)
+      } catch (error) {
+        warnings.push(`could not link ${link}: ${error?.message ?? error}`)
+      }
+    }
+    const onPath = String(process.env.PATH ?? '').split(':').includes(dir)
+    if (!onPath && changed.length > 0) {
+      warnings.push(`${dir} is not on PATH; add it, or call ${paths.cli} directly`)
+    }
+    return { changed, warnings }
+  }
+
   function isGeneratedUnit(unit) {
     const text = readText(unitPath(unit))
     return text !== undefined && GENERATED_MARKERS.some((marker) => text.includes(marker))
@@ -852,6 +1070,11 @@ export function createManager(ctx, rawConfig) {
     }
     try {
       result.changed.push(...writeSupervisor(), ...writeUnits())
+      // The CLI is best effort: a machine where $HOME/bin cannot be written must
+      // still get its supervisor, so its failure is a warning, not an error.
+      const cli = writeCli()
+      result.changed.push(...cli.changed)
+      result.warnings.push(...cli.warnings)
     } catch (error) {
       return finish({ ok: false, error: `cannot write the supervisor/units: ${error?.message ?? error}` })
     }
@@ -1344,6 +1567,7 @@ export function createManager(ctx, rawConfig) {
       profile: settings.profile,
       safeProfile: settings.safeProfile,
       appArgs: appArgs(),
+      port: portState(),
       supervisor: supervisorState(),
       client: clientState(),
       clientHeartbeat: clientHeartbeat(),
@@ -1422,6 +1646,46 @@ export function createManager(ctx, rawConfig) {
             if (query(req).searchParams.get('hb') === '1') recordHeartbeat()
             sendJson(res, 200, await status())
           } catch (error) { sendJson(res, 500, { ok: false, error: String(error?.message ?? error) }) }
+        },
+      },
+      {
+        kind: 'exact',
+        path: `${ROUTE_PREFIX}/port`,
+        handler: async (req, res) => {
+          const params = query(req).searchParams
+          if (req.method === 'GET') {
+            try {
+              sendJson(res, 200, { ok: true, ...portState() })
+            } catch (error) { sendJson(res, 500, { ok: false, error: String(error?.message ?? error) }) }
+            return
+          }
+          if (!mutating(req, res)) return
+          try {
+            const requested = params.get('port')
+            const result = setNextPort(requested, {
+              safePort: params.get('safePort'),
+              by: params.get('by') === 'cli' ? 'cli' : 'ui',
+            })
+            if (!result.ok) {
+              // A bad port is the caller's mistake, not a broken daemon: no file
+              // was touched, so nothing here needs repairing.
+              sendJson(res, result.error === 'write-failed' ? 500 : 400, { ok: false, error: result.error, message: result.message, value: result.value ?? requested })
+              return
+            }
+            const body = { ok: true, ...portState(), changed: result.changed }
+            if (params.get('restart') !== '1') {
+              sendJson(res, 200, body)
+              return
+            }
+            const plan = await planRestart()
+            recordEvent('host', 'port:restart', { port: result.record.port, action: plan.action })
+            sendJson(res, 202, { ...body, plan, note: 'the new port takes effect once the process is back' })
+            // Same 250ms as /restart: long enough for the 202 to reach the
+            // caller on loopback, short enough not to be felt.
+            setTimeout(() => { performRestart(plan).catch((error) => warn(`restart for a new port failed: ${error?.message ?? error}`)) }, 250)
+          } catch (error) {
+            sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
+          }
         },
       },
       {
@@ -1554,12 +1818,17 @@ export function createManager(ctx, rawConfig) {
 
   function bindPort(port) {
     if (Number.isFinite(port) && port > 0) livePort = port
+    // Publish the live port for the CLI as soon as it is known: before this the
+    // only way to reach the daemon was to guess from the state directory's lock
+    // file name.
+    if (livePort > 0) writeRuntime()
   }
 
   async function activate() {
     if (activated || disposed) return
     activated = true
     watchReadiness()
+    writeRuntime()
     if (!settings.installOnActivate) {
       info('activation: installOnActivate=false, only reporting status')
       return
@@ -1596,7 +1865,7 @@ export function createManager(ctx, rawConfig) {
     activated = false
   }
 
-  return { bindPort, activate, dispose, routes, status, install, uninstall, repair, selftest, planRestart, performRestart, clearSafeMode, settings, paths }
+  return { bindPort, activate, dispose, routes, status, install, uninstall, repair, selftest, planRestart, performRestart, clearSafeMode, setNextPort, portState, settings, paths }
 }
 
 // ---------------------------------------------------------------------------

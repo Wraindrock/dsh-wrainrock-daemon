@@ -16,6 +16,9 @@
 #   17-18.  the 2026-10-17 fix: stopping one supervisor also stops the peer from
 #            the other systemd user manager, and the systemd-kill helper stops
 #            every supervisor and starts the unit again (restart really restarts)
+#   21.  the runtime port request in state/port.json: a valid one moves the
+#        launched command line and the lock name, an invalid one falls back to
+#        the baked pair, and an explicit environment value wins over the file
 set -uo pipefail
 
 # The port guards are exercised explicitly in section 13+; every earlier section
@@ -454,6 +457,121 @@ await '[ ! -s "$SCRATCH/home/state/recovery-override.yml" ]' 30
 check "the overlay was removed again after a healthy run" "yes" \
   "$(grep -q 'crash override removed (healthy run)' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
 kill -TERM "$SUP" 2>/dev/null; wait "$SUP" 2>/dev/null
+
+# Run one rendered supervisor until it has launched its first child, then stop
+# it; the checks below inspect the real command line it logged and the real lock
+# name it chose. `$1` is the content of <state>/port.json ('' = no file at all)
+# and any further arguments are extra environment assignments for the run.
+run_port_case() { # port-json [env-assignment...]
+  local port_json="$1"
+  shift
+  prepare
+  if [ -n "$port_json" ]; then printf '%s' "$port_json" >"$SCRATCH/home/state/port.json"; fi
+  env "$@" DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 \
+    DSH_WRAINROCK_DAEMON_SKIP_SAFE_PROFILE=1 bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+  SUP=$!
+  await 'grep -q "start mode=" "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null' 15
+  kill -TERM "$SUP" 2>/dev/null
+  wait "$SUP" 2>/dev/null
+}
+
+# The same, but booting the sticky safe mode with a request file: safe mode has
+# to follow the effective pair too.
+run_safe_port_case() { # port-json
+  prepare
+  printf '%s' "$1" >"$SCRATCH/home/state/port.json"
+  printf 'safe\n' >"$SCRATCH/home/state/mode"
+  mkdir -p "$SCRATCH/dshhome/profiles/dsh-safe"
+  printf '{}' >"$SCRATCH/dshhome/profiles/dsh-safe/package.json"
+  DSH_WRAINROCK_DAEMON_EXEC="sleep 30" DSH_WRAINROCK_DAEMON_SKIP_PREFLIGHT=1 \
+    bash "$SCRATCH/supervisor.sh" >/dev/null 2>&1 &
+  SUP=$!
+  await 'grep -q "start mode=safe" "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null' 15
+  kill -TERM "$SUP" 2>/dev/null
+  wait "$SUP" 2>/dev/null
+}
+
+echo "21. the next-start port is read from state/port.json at runtime"
+# (a) with no request file at all the baked pair stays in force.
+run_port_case ""
+LAUNCH_LINE="$(grep -m1 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(a) the baked port is launched" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 3999' && echo yes || echo no)"
+check "(a) the baked lock name is used" "yes" \
+  "$(grep -q 'lock=.*supervisor-web-3999\.lock' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+check "(a) nothing is logged as an override" "no" \
+  "$(grep -q 'port override:' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+
+# (b) a valid request moves the command line, the port guard pair and the lock.
+run_port_case '{"port":4501,"at":"2026-11-07T00:00:00Z","by":"cli"}'
+LAUNCH_LINE="$(grep -m1 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(b) the launched command line carries --port 4501" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 4501' && echo yes || echo no)"
+check "(b) the baked port is not launched" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 3999' && echo no || echo yes)"
+check "(b) the lock name follows the request" "yes" \
+  "$(grep -q 'lock=.*supervisor-web-4501\.lock' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+check "(b) the override is logged exactly once" "1" \
+  "$(grep -c 'port override:' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null | head -1)"
+if command -v flock >/dev/null 2>&1; then
+  check "(b) the lock file really exists at the requested port" "yes" \
+    "$([ -f "$SCRATCH/home/state/supervisor-web-4501.lock" ] && echo yes || echo no)"
+fi
+
+# (c) an invalid request (zero, out of range, not JSON at all) is ignored.
+for BAD in '{"port":0}' '{"port":70000}' 'not json at all {{{'; do
+  run_port_case "$BAD"
+  LAUNCH_LINE="$(grep -m1 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+  check "(c) invalid request '$BAD' keeps --port 3999" "yes" \
+    "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 3999' && echo yes || echo no)"
+  check "(c) invalid request '$BAD' keeps the baked lock" "yes" \
+    "$(grep -q 'lock=.*supervisor-web-3999\.lock' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+done
+
+# (d) an explicit environment value wins over the request file.
+run_port_case '{"port":4501,"safePort":4502}' DSH_WRAINROCK_DAEMON_PORT=4602
+LAUNCH_LINE="$(grep -m1 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(d) the environment port wins over the file" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 4602' && echo yes || echo no)"
+check "(d) the file port is not launched" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 4501' && echo no || echo yes)"
+check "(d) the lock name follows the environment port" "yes" \
+  "$(grep -q 'lock=.*supervisor-web-4602\.lock' "$SCRATCH/home/logs/supervisor.log" 2>/dev/null && echo yes || echo no)"
+
+# (e) safe mode follows the same effective ports.
+run_safe_port_case '{"port":4501}'
+SAFE_LINE="$(grep -m1 'start mode=safe' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(e) safe mode defaults to the effective port + 1" "yes" \
+  "$(printf '%s' "$SAFE_LINE" | grep -q -- '--port 4502' && echo yes || echo no)"
+check "(e) safe mode drops the baked safe port" "yes" \
+  "$(printf '%s' "$SAFE_LINE" | grep -q -- '--port 4000' && echo no || echo yes)"
+run_safe_port_case '{"port":4501,"safePort":4503}'
+SAFE_LINE="$(grep -m1 'start mode=safe' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(e) an explicit safePort is honoured" "yes" \
+  "$(printf '%s' "$SAFE_LINE" | grep -q -- '--port 4503' && echo yes || echo no)"
+
+# (f) the rewrite handles every generated shape: `--port=N`, no `--port` token
+# at all, and a dangling `--port` with its value missing.
+run_port_case '{"port":4501}' DSH_WRAINROCK_DAEMON_APP_ARGS='--no-open --port=3999'
+LAUNCH_LINE="$(grep -m1 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(f) --port=N is rewritten in place" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port=4501' && echo yes || echo no)"
+check "(f) the old --port=N value is gone" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port=3999' && echo no || echo yes)"
+
+run_port_case '{"port":4501}' DSH_WRAINROCK_DAEMON_APP_ARGS='--no-open'
+LAUNCH_LINE="$(grep -m1 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(f) a missing --port token is appended" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 4501' && echo yes || echo no)"
+check "(f) the rest of the argument line is kept" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--no-open' && echo yes || echo no)"
+
+run_port_case '{"port":4501}' DSH_WRAINROCK_DAEMON_APP_ARGS='--no-open --port'
+LAUNCH_LINE="$(grep -m1 'start mode=' "$SCRATCH/home/logs/dsh.out.log" 2>/dev/null)"
+check "(f) a dangling --port token gets its value" "yes" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -q -- '--port 4501' && echo yes || echo no)"
+check "(f) the rewound token is not duplicated" "1" \
+  "$(printf '%s' "$LAUNCH_LINE" | grep -o -- '--port' | wc -l | tr -d ' ')"
 
 if [ "$FAILED" = "0" ]; then
   echo "all supervisor ladder tests passed"

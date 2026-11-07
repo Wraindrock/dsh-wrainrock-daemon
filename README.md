@@ -62,7 +62,9 @@
   ```
   GET  /dsh-wrainrock-daemon/status       # systemd / 看护 / 事故 / 路径 全量状态
   GET  /dsh-wrainrock-daemon/log?lines=200&source=dsh
+  GET  /dsh-wrainrock-daemon/port         # 端口快照（同 status.port：current/source/next/nextSafe/override/pending）
   POST /dsh-wrainrock-daemon/restart      # 同“重启”按钮
+  POST /dsh-wrainrock-daemon/port?port=N[&safePort=N][&restart=1]   # 设定“下次启动端口”（restart=1 先回 202，约 250ms 后重启）
   POST /dsh-wrainrock-daemon/install      # 重写脚本与 unit、daemon-reload、enable
   POST /dsh-wrainrock-daemon/uninstall    # 反注册并删除 unit（报告保留）
   POST /dsh-wrainrock-daemon/repair       # 立刻做一次配置校验/恢复
@@ -75,6 +77,40 @@
   （最多 20 秒记一次，用来判断页面是否还活着，curl 不会污染它）。
   `/status` 里的 `health` 是自检结论：解析**生成的**脚本，报告其中烘焙的 node/dsh 路径是否仍然存在
   （`health.ok=false` 说明自启动"看起来装好了"但实际起不来）；`lastInstall` 是最近一次安装结果。
+  `/status` 里的 `port` 对象是端口快照：`current` 是**正在监听**的端口，`source` 说明它从哪来
+  （`live` = 运行实例上报 / `override` = `state/port.json` / `config` = 配置烘焙；只要实例上报了端口就是 `live`），
+  `next` / `nextSafe` / `safePort` 是**下一次启动**会用的主端口与安全端口（`nextSafe` 与 `safePort` 同值，
+  没写安全端口时默认取 `next + 1`），`override` 是**布尔**——表示存在 `state/port.json` 覆盖，
+  哪怕它写的端口恰好就是当前端口；`requestedAt` / `requestedBy` 是那次写入的时间与来源（`cli` / `ui`）；
+  `pending` 表示「下次启动端口 ≠ 当前端口」，也就是这份改动还没生效、要重启一次才应用。
+  `POST /port` 和其余写操作一样要带 `x-dsh-wrainrock-daemon: 1` 头，并接受 `&by=cli`（`dwd` 自己会带）；
+  端口非法时返回 400（`{ok:false,error:'invalid-port'|'invalid-safe-port',…}`）且不写文件，
+  成功时回 `changed` 列出实际改动的字段；带 `restart=1` 时先回 202、约 250ms 后重启。
+
+### 命令行：`dwd`
+
+插件把命令行工具写到 `<homeDir>/bin/dwd`（默认 `~/.dsh/wrainrock-daemon/bin/dwd`），并在 `cliDir`
+（默认 `$HOME/bin`，本机登录 shell 的 PATH 首位）里建 `dwd` 与 `dsh-wrainrock-daemon` 两个软链接：
+
+```bash
+dwd status                 # 当前端口、设置的下次启动端口与 daemon 状态
+dwd rp 3081                # 把「下次启动端口」设为 3081（别名：dwd report 3081），随后自动重启使其立刻生效
+dwd rp 3081 --no-restart   # 只改「下次启动端口」，现在不重启
+dwd rp 3081 --safe-port 3099   # 顺带指定下次启动的安全模式端口
+dwd restart                # 现在就重启（同面板「重启」按钮）
+dwd help                   # 用法
+```
+
+`dwd rp <port>` 改的是**下一次启动**的端口，不带 `--no-restart` 时会紧接着重启一次让新端口马上生效
+（等价于设置页的「保存并重启」）。`--no-restart` 则只落盘，下次开机/重启时才用新端口。
+它优先调本机的 `POST /port`（因此端口来源记成 `cli`）；守护进程没在跑时自己把 `state/port.json`
+原子写下来，再交给 systemd（或提示你手动重启）。`dwd status` 同理：进程没应答时退化为直接读
+`state/runtime.json` / `state/port.json`，并把端口来源标成 `offline`。
+若 `$HOME/bin` 不在 PATH 上（或想换地方），把 `cliDir` 指到一个已经在 PATH 里的目录，或者自己加进去：
+
+```bash
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc   # bash 用 ~/.bashrc
+```
 
 ## 生成的文件
 
@@ -84,7 +120,10 @@
 ~/.config/systemd/user/default.target.wants/dsh-wrainrock-daemon.service -> ../dsh-wrainrock-daemon.service
 ~/.dsh/wrainrock-daemon/bin/supervisor.sh                    # 看护脚本（由插件生成，勿手改）
 ~/.dsh/wrainrock-daemon/bin/relaunch.sh                      # 手动实例的接管助手
+~/.dsh/wrainrock-daemon/bin/dwd                              # 命令行工具（cliDir 里的 dwd / dsh-wrainrock-daemon 软链接指向它）
 ~/.dsh/wrainrock-daemon/state/                               # mode / failures / last_exit / incident.json
+~/.dsh/wrainrock-daemon/state/port.json                      # 「下次启动端口」唯一事实来源：{port, safePort, at, by}
+~/.dsh/wrainrock-daemon/state/runtime.json                   # 当前运行实例：{pid, port, safePort, unit, profile, at}
 ~/.dsh/wrainrock-daemon/state/supervisor-<profile>-<port>.lock   # 看护单例锁（flock，进程退出即释放）
 ~/.dsh/wrainrock-daemon/backup/                              # 最近一次能正常组合的 profile 配置快照
 ~/.dsh/wrainrock-daemon/reports/                             # 事故报告（incident-*.md、latest.md、broken-*/）
@@ -97,6 +136,44 @@
 systemctl --user status dsh-wrainrock-daemon.service
 grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.out.log | tail -1
 ```
+
+## 端口状态（state/port.json / state/runtime.json）
+
+「下一次启动监听哪个端口」以状态文件为准，不必改配置：
+
+```
+~/.dsh/wrainrock-daemon/state/port.json      # {port, safePort, at, by} —— 下次启动端口
+~/.dsh/wrainrock-daemon/state/runtime.json   # {pid, port, safePort, unit, profile, at} —— 当前运行的实例
+```
+
+- `state/port.json` 是「下次启动端口」的**唯一事实来源**；文件不存在时用配置里的 `port`。它由
+  `dwd rp`、`POST /port` 与设置页写入（原子替换），`at`/`by` 记录写入时间与来源（`cli` / `ui`）。
+- `state/runtime.json` 描述**正在跑**的那一份：`{pid, port, safePort, unit, profile, at}`，
+  其中 `port` 是当前端口、`safePort` 是本次算出的安全端口（同 `/status.port.nextSafe`）。
+  它供 `dwd status`、设置页与 `/status.port.source=live` 读取。
+- 看护脚本只用 `grep`/`sed` 读 `port.json`（**不依赖 jq**）；文件缺失、JSON 坏掉或端口越界时一律忽略，
+  退回烘焙进脚本的配置端口——手改坏一份状态文件不会让服务起不来。
+- 生成的看护脚本取端口的优先级是：**显式环境变量 `DSH_WRAINROCK_DAEMON_PORT` >
+  `state/port.json` > 烘焙进脚本的配置端口**。也就是说 `dwd rp` 设过的值不会被重新生成的脚本覆盖，
+  而临时 `DSH_WRAINROCK_DAEMON_PORT=… systemctl --user restart …` 又能压过两者（安全模式同理走 `safePort`）。
+- 安全模式端口同样按这套优先级取 `safePort`；`state/port.json` 里没写安全端口时默认取「下次启动端口 + 1」。
+
+## 设置 → Daemon 页
+
+面板的 **设置 → Daemon** 页把端口收在一处：
+
+- **当前端口**：正在监听的端口（优先读 `GET /port`，进程没应答时退回 `state/runtime.json`），只读，
+  并标明来源（实际运行中 / 来自下次启动覆盖 / 来自配置）；
+- **下次启动端口**：填入要写的值，两个按钮——
+  - `保存`：写 `state/port.json`，下次启动生效（等价 `dwd rp <port> --no-restart`）；
+  - `保存并重启`：写完立刻重启，新端口马上生效（等价 `dwd rp <port>`）。
+- **转发至 Cloudflare 域名** 一行：实验性占位，见下。
+
+### 实验性功能
+
+**「转发至 Cloudflare 域名」是实验性·开发中，目前只是一个占位行：不可点击，也不做任何事**——
+不会建隧道、不改配置、不联网。它只是先把「把本机 GUI 暴露到某个 Cloudflare 域名」这个方向摆在设置页上，
+等真正实现后才可用；现在请勿据此排查连通性问题。
 
 ## 恢复阶梯
 
@@ -116,7 +193,10 @@ grep -o 'http://127.0.0.1:[0-9]*/?token=[^ ]*' ~/.dsh/wrainrock-daemon/logs/dsh.
 
 `unitName`、`safeUnitName`、`safeProfile`、`safeTemplate`、`failureThreshold`、`failureWindowSeconds`、
 `healthySeconds`、`maxBackoffSeconds`、`port`、`safePort`、`portGuard`、`host`、`extraAppArgs`、`cliPath`、`nodeBin`、
-`homeDir`、`unitDir`、`installOnActivate`、`containerOnly`、`startAtBoot`、`enableLinger`、`notify`。
+`cliDir`、`homeDir`、`unitDir`、`installOnActivate`、`containerOnly`、`startAtBoot`、`enableLinger`、`notify`。
+
+`cliDir`（默认 `$HOME/bin`）是放置 `dwd` / `dsh-wrainrock-daemon` 两个软链接的目录，改它不会移动
+`<homeDir>/bin/dwd` 本体，只换链接位置。
 
 `safePort` 默认是主端口 + 1（安全模式专用）；`portGuard`（默认 `true`）控制「同伴端口识别 + 等待而不升级」这套守卫。
 `containerOnly` 默认在容器里为 `true`：distrobox/podman 下宿主机和容器各有一个 systemd 用户管理器，而它们读的是
@@ -146,7 +226,8 @@ bash tests/ladder.sh
 **从已安装布局自动修复 node/dsh 路径**、**收到 stop 信号立刻退出**、
 **改名迁移（两代旧名）**、**同伴端口等待 / 锁待命 / 端口竞争不计失败 / 安全模式独立端口**、
 **停掉一个看护会停掉另一个管理器的同伴**、**systemd-kill helper 会停掉所有看护并重新拉起 unit**。
-不触碰真实 profile 与真实 unit。另有 `node tests/restart-plan.mjs`（重启决策）与 `node tests/migration.mjs`（改名迁移）。
+不触碰真实 profile 与真实 unit。另有 `node tests/restart-plan.mjs`（重启决策）、`node tests/migration.mjs`（改名迁移）
+与 `node tests/port-state.mjs`（端口取值解析、`state/port.json` 覆盖文件的读取、端口快照 `current/next/pending/source` 优先级）。
 
 ## 修复记录
 
@@ -266,7 +347,9 @@ systemctl --user show dsh-wrainrock-daemon.service -p MainPID --value   # 应等
 - unit 语法 `systemd-analyze --user verify`、`systemctl --user is-enabled` = `enabled`、`loginctl` linger；
 - 看护阶梯 **18 组断言全绿**（`bash tests/ladder.sh`，含「冗余用户管理器时第二个看护待命」「安全模式走独立端口」
   「停掉一个看护会停掉同伴」「systemd-kill helper 重新拉起 unit」四组新断言）
-  + 重启决策测试（`node tests/restart-plan.mjs`）+ 改名迁移测试（`node tests/migration.mjs`，对 `dsh-ian-daemon` 与 `dsh-autostart` 两代旧名各跑一遍）；
+  + 重启决策测试（`node tests/restart-plan.mjs`）+ 改名迁移测试（`node tests/migration.mjs`，对 `dsh-ian-daemon` 与 `dsh-autostart` 两代旧名各跑一遍）
+  + 端口状态测试（`node tests/port-state.mjs`：解析 `0`/`65536`/`-1`/`'abc'`/`''`/`null`/`3080`/`'3080'`/`' 3080 '`/`'3080.5'`，
+    `state/port.json` 缺失/合法/坏 JSON/越界/`safePort:null`，以及快照 `live > override > config` 的优先级与 `pending` 判定）；
 - 用与 `ExecStart` 完全相同的命令行真实启动过 Harness；
 - **真实重启电脑后自动起来**（开机 15 秒内拉起，无需登录），关机时看护脚本干净退出；
 - 手动「重启」按钮点击后成功由 systemd 接管；
@@ -298,3 +381,6 @@ MIT © 2026 Grant-Felix — 见 [LICENSE](LICENSE)。
 - 服务在开机时若端口被**非本项目的**进程占用，仍会按快速失败计数升级到安全模式（此时安全模式用 `safePort` 启动，依然可用）；若占用者是**本项目的另一个实例**，则认定成同伴、等待它退出，绝不会因此升级。
 - 只接管自己写过的 unit：若 `~/.config/systemd/user/dsh-wrainrock-daemon.service` 已存在且不含本插件标记，会先备份为 `*.pre-dsh-wrainrock-daemon` 再覆盖。
 - `package.json` 里的 `private: true` 只用于避免误发到 npm registry；从 GitHub 安装不受影响，要发布到 npm 时删掉它即可。
+- 「转发至 Cloudflare 域名」（设置 → Daemon）是**实验性·开发中**的占位行：不可点击、不做任何事，见上文「实验性功能」。
+- `state/port.json` 只影响**下一次启动**：写完不重启（`--no-restart` / 只点「保存」）时，当前进程仍监听旧端口，
+  此时 `/status.port.pending` 为 `true`；`dwd status` 会区分「当前端口」与「下次启动端口」。

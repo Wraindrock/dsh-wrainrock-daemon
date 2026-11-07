@@ -19,6 +19,7 @@
     "cordis.patch.yml",
     "supervisor.sh",
     "relaunch.sh",
+    "dwd.sh",
     "units/*",
     "locale/*.json",
     "icon.svg",
